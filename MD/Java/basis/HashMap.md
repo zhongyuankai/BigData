@@ -2,7 +2,7 @@
 
 ## Java7 HashMap
 
-![](MD/Java/basis/img/hashmap7.png)
+![](img/hashmap7.png)
 
 如图所示，HashMap 底层是基于数组和链表实现的。其中有两个重要的参数：
 
@@ -56,7 +56,7 @@ map.forEach((key,value)->{
 
 ## Java8 HashMap
 
-![](MD/Java/basis/img/hashmap8.png)
+![](img/hashmap8.png)
 
 Java7中使用Entry来代表每个HashMap中的数据节点, Java8中使用Node,基本没有区别,都是key, value, hash和next这四个属性。
 
@@ -76,7 +76,7 @@ Java7中使用Entry来代表每个HashMap中的数据节点, Java8中使用Node,
 
 并发场景发生扩容，调用 `resize()` 方法里的 `rehash()` 时，容易出现环形链表。这样当获取一个不存在的 `key` 时，计算出的 `index` 正好是环形链表的下标时就会出现死循环。
 
-![](MD/Java/basis/img/hashmap3.png)
+![](img/hashmap3.png)
 
 > 所以 HashMap 只能在单线程中使用，并且尽量的预设容量，尽可能的减少扩容。
 > 多线程场景下推荐使用 `ConcurrentHashMap`;

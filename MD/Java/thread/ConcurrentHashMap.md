@@ -7,7 +7,7 @@
 ## JDK1.7 实现
 
 ### 数据结构
-![](MD/Java/thread/img/concurrentHashMap7.png)
+![](img/concurrentHashMap7.png)
 
 如图所示，是由 `Segment` 数组、`HashEntry` 数组组成，和 `HashMap` 一样，仍然是数组加链表组成。
 
@@ -56,7 +56,7 @@
 
 ## JDK1.8 实现
 
-![](MD/Java/thread/img/concurrentHashMap8.png)
+![](img/concurrentHashMap8.png)
 
 1.8 中的 ConcurrentHashMap 数据结构和实现与 1.7 还是有着明显的差异。
 

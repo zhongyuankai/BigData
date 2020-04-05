@@ -2,6 +2,7 @@
 记录自己Java和大数据的学习过程。
 
 ## Java 基础
+- [Java 基础常考知识点](MD/Java/basis/JavaBasis.md)
 
 ### Java 集合
 - [ArrayList/Vector](MD/Java/basis/ArrayList.md)

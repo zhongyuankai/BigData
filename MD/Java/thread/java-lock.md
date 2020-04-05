@@ -28,13 +28,13 @@
 - 非阻塞的情况可以用 `while` 循环来实现，循环的时候记录时间，达到 X 秒记为超时，`break`。
 - 可以开启一个定时任务每隔一段时间扫描找出多少 X 秒都没有被删除的记录，主动删除这条记录。
 
-## 基于 Redis
+### 基于 Redis
 
 利用 Redis set key 时的一个 NX 参数可以保证在这个 key 不存在的情况下写入成功。并且再加上 EX 参数可以让该 key 在超时之后自动删除，这样也可以避免死锁；
 
 可以参考：[基于 Redis 的分布式锁](https://crossoverjie.top/2018/03/29/distributed-lock/distributed-lock-redis/)
 
-## 基于 ZK
+### 基于 ZK
 
 分布式锁算法流程如下：
 

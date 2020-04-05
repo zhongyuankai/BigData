@@ -30,7 +30,8 @@
 
 ## 基于 Redis
 
-利用 Redis set key 时的一个 NX 参数可以保证在这个 key 不存在的情况下写入成功。并且再加上 EX 参数可以让该 key 在超时之后自动删除，这样也可以避免死锁
+利用 Redis set key 时的一个 NX 参数可以保证在这个 key 不存在的情况下写入成功。并且再加上 EX 参数可以让该 key 在超时之后自动删除，这样也可以避免死锁；
+
 可以参考：[基于 Redis 的分布式锁](https://crossoverjie.top/2018/03/29/distributed-lock/distributed-lock-redis/)
 
 ## 基于 ZK

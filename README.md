@@ -4,4 +4,4 @@
 ## Java基础
 
 ## Java多线程
-	- [锁的种类与介绍](thread/java-lock.md)
+- [锁的种类与介绍](thread/java-lock.md)

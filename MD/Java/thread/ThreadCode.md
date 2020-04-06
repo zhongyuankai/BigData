@@ -1,4 +1,4 @@
-**大厂面试手写题**
+**多线程代码实践-大厂面试题**
 
 # 1. 手写阻塞队列
 
@@ -6,7 +6,7 @@
     1. 当队列为空的时候，take操作应该阻塞。
     2. 当队列为满的时候，put操作应该阻塞。
 	
-- `synchronized` 锁代码实现：
+## `synchronized` 锁代码实现：
 ```java
 class MyBlockingQueue<T> {
 
@@ -86,7 +86,7 @@ class MyBlockingQueue<T> {
     }
 }
 ```
-- `ReentrantLock` 代码实现：
+## `ReentrantLock` 代码实现：
 ```java
 class MyBlockingQueue<T> {
     // 队列，存放资源

@@ -78,7 +78,13 @@ public class DeadLockDemo {
 - Collections.synchronizedList(List l)函数返回一个线程安全的ArrayList类；
 - concurrent并发包下的CopyOnWriteArrayList类。
 
+## 什么是并发容器的实现？
 
+Java集合类都是**快速失败**的，这就意味着当集合被改变且一个线程在使用迭代器遍历集合的时候，迭代器的next()方法将抛出ConcurrentModificationException异常。
+
+**并发容器支持并发的遍历和并发的更新**。
+
+主要的类有ConcurrentHashMap, CopyOnWriteArrayList 和CopyOnWriteArraySet，
 
 
 

@@ -46,25 +46,9 @@ ThreadLocal.ThreadLocalMap inheritableThreadLocals = null;
 ThreadLocal源码如下：
 ```java
 public class ThreadLocal<T> {
-	/**
-	* ThreadLocalMap is a customized hash map suitable only for
-	* maintaining thread local values. No operations are exported
-	* outside of the ThreadLocal class. The class is package private to
-	* allow declaration of fields in class Thread. To help deal with
-	* very large and long-lived usages, the hash table entries use
-	* WeakReferences for keys. However, since reference queues are not
-	* used, stale entries are guaranteed to be removed only when
-	* the table starts running out of space.
-	*/
+
 	static class ThreadLocalMap {
-	/**
-		* The entries in this hash map extend WeakReference, using
-		* its main ref field as the key (which is always a
-		* ThreadLocal object). Note that null keys (i.e. entry.get()
-		* == null) mean that the key is no longer referenced, so the
-		* entry can be expunged from table. Such entries are referred to
-		* as "stale entries" in the code that follows.
-		*/
+
 		// Entry 继承了弱引用，方便GC
 		static class Entry extends WeakReference<ThreadLocal<?>> {
 		/** The value associated with this ThreadLocal. */

@@ -1,6 +1,6 @@
 # CAS 底层原理
 
-体验一下原子类中的cas操作
+体验一把原子类中的CAS操作
 ```java
 public class CASDemo {
     public static void main(String[] args) {
@@ -37,7 +37,16 @@ public final int getAndIncrement() {
 
 2. 变量`valueoffset`,便是该变量在内存中的偏移地址,因为UnSafe就是根据内存偏移地址获取数据的;
 
-![](img/unsafe1.png)
+```java
+/**
+ * Atomically increments by one the current value.
+ *
+ * @return the previous value
+ */
+public final int getAndIncrement() {
+    return unsafe.getAndAddInt(this, valueOffset, 1);
+}
+```
 
 3.变量value用volatile修饰,保证了多线程之间的可见性.
 
@@ -63,7 +72,27 @@ unSafe.getAndIncrement源码分析：
 > 如果相同,更新var5的值并且返回true
 > 如果不同,继续取值然后比较,直到更新完成
 
-![](img/unsafe2.png)
+```java
+
+/**
+ * Atomically increments by one the current value.
+ *
+ * @return the previous value
+ */
+public final int getAndIncrement() {
+    return unsafe.getAndAddInt(this, valueOffset, 1);
+}
+
+
+public final int getAndAddInt(Object paramObject, long paramLong, int paramInt)
+{
+  int i;
+  do
+    i = getIntVolatile(paramObject, paramLong);
+  while (!compareAndSwapInt(paramObject, paramLong, i, i + paramInt));
+  return i;
+}
+```
 
 > 假设线程A和线程B两个线程同时执行getAndAddInt操作(分别在不同的CPU上):
 >  
@@ -92,6 +121,71 @@ ABA问题的产生：
 
 可以通过版本号来解决ABA问题。操作变量时从主内存拷贝变量到工作内存，同时要获取到版本号，当修改完变量写回主内存时，需要将获得的版本号与变量在主内存中的版本号比较，若大于或等于，则将值写回主内存，将版本号加1，否则，必须重新拷贝主内存中的值。
 
+Java中提供了现成的带时间戳的原子引用类`AtomicStampedReference`;
 
+```java
+/**
+ * Description: ABA问题的解决
+ **/
+public class ABADemo {
+	// 原子引用类
+    private static AtomicReference<Integer> atomicReference=new AtomicReference<>(100);
+
+	// 带时间戳的原子引用类
+    private static AtomicStampedReference<Integer> stampedReference=new AtomicStampedReference<>(100,1);
+	
+    public static void main(String[] args) {
+        System.out.println("===以下是ABA问题的产生===");
+        new Thread(()->{
+            atomicReference.compareAndSet(100,101);
+            atomicReference.compareAndSet(101,100);
+        },"t1").start();
+
+        new Thread(()->{
+            //先暂停1秒 保证完成ABA
+            try { TimeUnit.SECONDS.sleep(1); } catch (InterruptedException e) { e.printStackTrace(); }
+			
+            System.out.println(atomicReference.compareAndSet(100, 2019)+"\t"+atomicReference.get());
+        },"t2").start();
+		
+        try { TimeUnit.SECONDS.sleep(2); } catch (InterruptedException e) { e.printStackTrace(); }
+		
+		
+        System.out.println("===以下是ABA问题的解决===");
+
+        new Thread(()->{
+			// 查看当前版本号
+            int stamp = stampedReference.getStamp();
+            System.out.println(Thread.currentThread().getName()+"\t 第1次版本号"+stamp+"\t值是"+stampedReference.getReference());
+            
+			//暂停1秒钟t3线程
+            try { TimeUnit.SECONDS.sleep(1); } catch (InterruptedException e) { e.printStackTrace(); }
+			// 更新值
+            stampedReference.compareAndSet(100,101,stampedReference.getStamp(),stampedReference.getStamp()+1);
+            
+			System.out.println(Thread.currentThread().getName()+"\t 第2次版本号"+stampedReference.getStamp()+"\t值是"+stampedReference.getReference());
+			
+			// 更新值
+			stampedReference.compareAndSet(101,100,stampedReference.getStamp(),stampedReference.getStamp()+1);
+			
+            System.out.println(Thread.currentThread().getName()+"\t 第3次版本号"+stampedReference.getStamp()+"\t值是"+stampedReference.getReference());
+        },"t3").start();
+
+        new Thread(()->{
+            int stamp = stampedReference.getStamp();
+            System.out.println(Thread.currentThread().getName()+"\t 第1次版本号"+stamp+"\t值是"+stampedReference.getReference());
+            
+			//保证线程3完成1次ABA
+            try { TimeUnit.SECONDS.sleep(3); } catch (InterruptedException e) { e.printStackTrace(); }
+			
+			// 更新值
+            boolean result = stampedReference.compareAndSet(100, 2019, stamp, stamp + 1);
+            
+			System.out.println(Thread.currentThread().getName()+"\t 修改成功否"+result+"\t最新版本号"+stampedReference.getStamp());
+            System.out.println("最新的值\t"+stampedReference.getReference());
+        },"t4").start();
+    }
+}
+```
 
 

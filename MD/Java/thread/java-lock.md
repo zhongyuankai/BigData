@@ -2,8 +2,40 @@
 
 ## 同一进程
 
+### 公平锁和非公平锁
+公平锁：就是很公平，在并发的环境中，每个线程在获取锁时会先查看锁维护的等待队列，如果为空，或者当前线程是等待队列的第一个，就占有锁，否则就会加入到等待队列中，以后会按照FIFO的规则从队列中取到自己。
+
+非公平锁：比较粗鲁，上来就直接尝试占有锁，如果尝试失败，就再采用类似公平锁那种方式。
+
+`ReentrantLock` 通过构造函数指定该锁是否是公平锁 ,默认是非公平锁 非公平锁的优点在于吞吐量比公平锁大.
+
+`synchronized`也是一种非公平锁.
+
+
 ### 重入锁
+ReentrantLock/synchronized就是一个典型的可重入锁;
+
 使用 `ReentrantLock` 获取锁的时候会判断当前线程是否为获取锁的线程，如果是则将同步的状态 +1 ,释放锁的时候则将状态 -1。只有将同步状态的次数置为 0 的时候才会最终释放锁。
+
+### 自旋锁
+指尝试获取锁的线程不会立即阻塞，而是**采用循环的方式去尝试获取锁**，这样做的好处是减少上下文的切换；
+
+```java
+public final int getAndAddInt(Object paramObject, long paramLong, int paramInt)
+{
+  int i;
+  do
+    i = getIntVolatile(paramObject, paramLong);
+  while (!compareAndSwapInt(paramObject, paramLong, i, i + paramInt));
+  return i;
+}
+```
+
+### 独占锁、共享锁
+
+独占锁：指该锁一次只能被一个线程持有。对ReentrantLock和Synchronized而言都是独占锁；
+
+共享锁：指该锁可被多个线程持有。对ReentrantReadWriterLock其读锁是共享锁，其写锁是独占锁。
 
 ### 读写锁
 使用 `ReentrantReadWriteLock` ,同时维护一对锁：读锁和写锁。当写线程访问时则其他所有锁都将阻塞，读线程访问时则不会。通过读写锁的分离可以很大程度的提高并发量和吞吐量。

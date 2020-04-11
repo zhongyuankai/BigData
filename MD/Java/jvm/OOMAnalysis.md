@@ -37,7 +37,9 @@ public class GCOverheadDemo {
         List<String> list = new ArrayList<>();
         try {
             while(true) {
-                // String的intern()方法就是扩充常量池的一个方法；当一个String实例str调用intern()方法时，Java查找常量池中是否有相同Unicode的字符串常量，如果有，则返回其的引用，如果没有，则在常量池中增加一个Unicode等于str的字符串并返回它的引用
+                // String的intern()方法就是扩充常量池的一个方法；当一个String实例str调用intern()方法时，
+				// Java查找常量池中是否有相同Unicode的字符串常量，如果有，则返回其的引用，
+				// 如果没有，则在常量池中增加一个Unicode等于str的字符串并返回它的引用
                 list.add(String.valueOf(i++).intern());
             }
         } catch (Throwable e) {

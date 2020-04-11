@@ -25,9 +25,11 @@
 - [多线程代码实践-大厂面试题](MD/Java/thread/ThreadCode.md)
 
 ## JVM
-- [Java 多线程常见问题](MD/Java/jvm/MemoryAlocation.md)
+- [Java 多线程常见问题](MD/Java/jvm/MemoryAllocation.md)
 - [对象的创建、内存分配和四大引用](MD/Java/jvm/newObject.md)
 - [类加载机制](MD/Java/jvm/ClassLoad.md)
-- [OOM 分析](MD/Java/jvm/OOM-analysis.md)
+- [OOM 分析](MD/Java/jvm/OOMAnalysis.md)
+- [垃圾回收](MD/Java/jvm/GarbageCollection.md)
+- [常用工具+实战](MD/Java/jvm/tools.md)
 
 

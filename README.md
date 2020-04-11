@@ -24,4 +24,10 @@
 - [线程池底层工作原理](MD/Java/thread/ThreadPool.md)
 - [多线程代码实践-大厂面试题](MD/Java/thread/ThreadCode.md)
 
+## JVM
+- [Java 多线程常见问题](MD/Java/jvm/MemoryAlocation.md)
+- [对象的创建、内存分配和四大引用](MD/Java/jvm/newObject.md)
+- [类加载机制](MD/Java/jvm/ClassLoad.md)
+- [OOM 分析](MD/Java/jvm/OOM-analysis.md)
+
 

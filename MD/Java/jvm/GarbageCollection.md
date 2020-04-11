@@ -165,6 +165,7 @@ Survivor区的数据移动到新的Survivor区，部分数据晋升到Old区；
 ![](img/G2.png)
 
 四步过程：
+
 ![](img/G3.png)
 
 与CMS相比的优势：

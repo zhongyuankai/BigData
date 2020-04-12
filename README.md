@@ -8,6 +8,8 @@
 - [HashMap](MD/Java/basis/HashMap.md)
 - [HashSet](MD/Java/basis/HashSet.md)
 - [LinkedHashMap](MD/Java/basis/LinkedHashMap.md)
+- [浅析I/O模型及NIO的实现](MD/Java/basis/NIO.md)
+- [Java8 新特性](MD/Java/basis/Java8.md)
 
 ## Java 多线程
 - [Java 多线程常见问题](MD/Java/thread/Thread-common-problem.md)

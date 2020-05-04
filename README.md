@@ -34,4 +34,22 @@
 - [垃圾回收](MD/Java/jvm/GarbageCollection.md)
 - [常用工具+实战](MD/Java/jvm/tools.md)
 
+## 计算机网络原理
+
+- [计算机网络](MD/basis/计算机网络.md)
+
+## 操作系统
+
+## 数据结构与算法
+
+## Mysql 数据库
+
+## Kafka 引擎
+
+- [kafka 的数据存储](MD/Bigdata/kafka/kafka的数据存储.md)
+- [Producer 发送模型](MD/Bigdata/kafka/Producer 发送模型.md)
+- [Producer Metadata 更新机制](MD/Bigdata/kafka/Producer Metadata 更新机制.md)
+- [Producer 端源码分析总结](MD/Bigdata/kafka/Producer Metadata 更新机制.md)
+- [Topic 创建过程](MD/Bigdata/kafka/Producer 端源码分析总结.md)
+
 

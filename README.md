@@ -44,6 +44,10 @@
 
 ## Mysql 数据库
 
+- [数据库水平垂直拆分](Mysql/数据库水平垂直拆分.md)
+- [MySQL 索引原理](Mysql/MySQL索引原理.md)
+- [事务的实现](Mysql/事务的实现.md)
+
 ## Kafka 引擎
 
 - [kafka 的数据存储](Bigdata/kafka/kafka的数据存储.md)

@@ -38,9 +38,12 @@
 
 - [计算机网络](Basis/计算机网络.md)
 
-## 操作系统
-
 ## 数据结构与算法
+
+- [二分法](Java/DataStructureAndAlgorithm/Binary.md)
+- [动态规划](Java/DataStructureAndAlgorithm/Dynamicprogramming.md)
+- [贪心算法](Java/DataStructureAndAlgorithm/greedy.md)
+- [哈希表](Java/DataStructureAndAlgorithm/HashTable.md)
 
 ## Mysql 数据库
 
@@ -54,6 +57,11 @@
 - [Producer 发送模型](Bigdata/kafka/Producer发送模型.md)
 - [Producer Metadata 更新机制](Bigdata/kafka/ProducerMetadata更新机制.md)
 - [Producer 端源码分析总结](Bigdata/kafka/Producer端源码分析总结.md)
+- [ProducerNIO网络模型](Bigdata/kafka/ProducerNIO网络模型.md)
 - [Topic 创建过程](Bigdata/kafka/Topic创建过程.md)
+- [Kafka 核心组件和流程](Bigdata/kafka/Kafka核心组件和流程.md)
 
+## Spark 引擎
 
+- [Yarn 集群模式部署流程源码分析](Bigdata/spark/Yarn集群模式部署流程源码分析.md)
+- [通讯架构源码解析](Bigdata/spark/通讯架构源码解析.md)

@@ -51,6 +51,11 @@
 - [MySQL 索引原理](Mysql/MySQL索引原理.md)
 - [事务的实现](Mysql/事务的实现.md)
 
+## Redis 缓存数据库
+
+- [Redis 基础](Redis/Redis基础.md)
+- [Redis 基础](Redis/缓存雪崩、击穿、穿透.md)
+
 ## Kafka 引擎
 
 - [kafka 的数据存储](Bigdata/kafka/kafka的数据存储.md)

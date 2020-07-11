@@ -44,6 +44,7 @@
 - [动态规划](Java/DataStructureAndAlgorithm/Dynamicprogramming.md)
 - [贪心算法](Java/DataStructureAndAlgorithm/greedy.md)
 - [哈希表](Java/DataStructureAndAlgorithm/HashTable.md)
+- [广度优先搜索](Java/DataStructureAndAlgorithm/BreadthFirstSearch.md)
 
 ## Mysql 数据库
 
@@ -54,7 +55,7 @@
 ## Redis 缓存数据库
 
 - [Redis 基础](Redis/Redis基础.md)
-- [Redis 基础](Redis/缓存雪崩、击穿、穿透.md)
+- [缓存雪崩、击穿、穿透](Redis/缓存雪崩、击穿、穿透.md)
 
 ## Kafka 引擎
 

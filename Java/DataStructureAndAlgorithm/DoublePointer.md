@@ -112,3 +112,91 @@ class Solution {
     }
 }
 ```
+
+## 3. 回文链表-234
+
+请判断一个链表是否为回文链表。
+
+示例 1:
+
+```
+输入: 1->2
+输出: false
+```
+
+示例 2:
+
+```
+输入: 1->2->2->1
+输出: true
+```
+
+进阶：
+
+```
+你能否用 O(n) 时间复杂度和 O(1) 空间复杂度解决此题？
+```
+
+思路分析：
+
+可以使用双指针法来比较两端的元素，并向中间移动。一个指针从起点向中间移动，另一个指针从终点向中间移动；
+
+代码：
+
+```java
+public boolean isPalindrome(ListNode head) {
+  // 将链表转为数组存储
+    List<Integer> vals = new ArrayList<>();
+    ListNode currentNode = head;
+    while (currentNode != null) {	
+        vals.add(currentNode.val);
+        currentNode = currentNode.next;
+    }
+  	// 首尾遍历比较
+    int front = 0;
+    int back = vals.size() - 1;
+    while (front < back) {
+        if (!vals.get(front).equals(vals.get(back))) {
+            return false;
+        }
+        front++;
+        back--;
+    }
+    return true;
+}
+```
+
+优化：
+
+```java
+public boolean isPalindrome(ListNode head) {
+    if (head == null || head.next == null) {
+        return true;
+    }
+    ListNode fast = head, slow = head;  //快慢指针
+    ListNode pre = null, cur = head;    //用于反转链表
+    //反转链表
+    while(fast != null && fast.next != null) {
+        cur = slow;
+        slow = slow.next;
+        fast = fast.next.next;
+        cur.next = pre;
+        pre = cur;
+    }
+    //fast不为空，说明是奇数，则slow指针右移一位
+    if (fast != null) {
+        slow = slow.next;
+    }
+    while(pre != null && slow != null) {
+        if (pre.val != slow.val) {
+            return false;
+        }
+        pre = pre.next;
+        slow = slow.next;
+    }
+    return true;
+}
+```
+
+
+

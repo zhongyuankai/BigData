@@ -64,6 +64,7 @@
 - [Producer Metadata 更新机制](Bigdata/kafka/ProducerMetadata更新机制.md)
 - [Producer 端源码分析总结](Bigdata/kafka/Producer端源码分析总结.md)
 - [ProducerNIO网络模型](Bigdata/kafka/ProducerNIO网络模型.md)
+- [KafkaProducer内存管理](Bigdata/kafka/KafkaProducer内存管理.md)
 - [Topic 创建过程](Bigdata/kafka/Topic创建过程.md)
 - [Kafka 核心组件和流程](Bigdata/kafka/Kafka核心组件和流程.md)
 

@@ -333,7 +333,7 @@ def onNewPartitionCreation(newPartitions: Set[TopicAndPartition]) {
 
 ### Partition 状态机
 
-关于 Partition 状态的变化可以参考 Kafka 中的这个方法 [PartitionStateMachine](https://github.com/apache/kafka/blob/0.10.2/core/src/main/scala/kafka/controller/PartitionStateMachine.scala)，状态机的具体转换情况如下图所示
+关于 Partition 状态的变化可以参考 Kafka 中的这个方法 PartitionStateMachine，状态机的具体转换情况如下图所示
 
 ![](img\partition_state.png)
 
@@ -348,7 +348,7 @@ def onNewPartitionCreation(newPartitions: Set[TopicAndPartition]) {
 
 ### Replica 状态机
 
-关于 Replica 状态的变化可以参考 Kafka 中的这个方法 [ReplicaStateMachine](https://github.com/apache/kafka/blob/0.10.2/core/src/main/scala/kafka/controller/ReplicaStateMachine.scala)，状态机的具体转换情况如下图所示
+关于 Replica 状态的变化可以参考 Kafka 中的这个方法 ReplicaStateMachine，状态机的具体转换情况如下图所示
 
 ![](img\replica_state.png)
 

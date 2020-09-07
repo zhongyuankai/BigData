@@ -46,6 +46,10 @@
 - [哈希表](Java/DataStructureAndAlgorithm/HashTable.md)
 - [广度优先搜索](Java/DataStructureAndAlgorithm/BreadthFirstSearch.md)
 
+## 设计模式
+
+- [常见设计模式的对比](Java/DesignPattern/常见设计模式的对比.md)
+
 ## Mysql 数据库
 
 - [数据库水平垂直拆分](Mysql/数据库水平垂直拆分.md)

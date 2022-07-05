@@ -79,9 +79,9 @@
 
 ## Clickhouse 引擎
 
-- [源码阅读 - clickhouse-server是如何启动](Bigdata/clickhouse/1_源码阅读 - clickhouse-server是如何启动的.md)
-- [2_Clickhouse 分布式表的写入原理](Bigdata/clickhouse/2_Clickhouse 分布式表的写入原理.md)
+- [源码阅读Server是如何启动](Bigdata/clickhouse/1_源码阅读 - clickhouse-server是如何启动的.md)
+- [Clickhouse分布式表的写入原理](Bigdata/clickhouse/2_Clickhouse 分布式表的写入原理.md)
 - [两行代码节省30%的CPU消耗](Bigdata/clickhouse/3_两行代码节省30%的CPU消耗.md)
-- [ReplicatedMergeTree 后台任务的工作原理](Bigdata/clickhouse/4_Clickhouse ReplicatedMergeTree 后台任务的工作原理.md)
-- [Clickhouse-copier 源码剖析](Bigdata/clickhouse/5_Clickhouse-copier 源码剖析.md)
+- [ReplicatedMergeTree后台任务的工作原理](Bigdata/clickhouse/4_Clickhouse ReplicatedMergeTree 后台任务的工作原理.md)
+- [ClickhouseCopier源码剖析](Bigdata/clickhouse/5_Clickhouse-copier 源码剖析.md)
 - [MergeTree的写入流程](Bigdata/clickhouse/6_MergeTree的写入流程.md)

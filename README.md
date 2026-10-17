@@ -87,3 +87,7 @@
 - [ReplicatedMergeTree 后台任务的工作原理](Clickhouse/4_ReplicatedMergeTree后台任务的工作原理.md)
 - [Clickhouse-copier 源码剖析](Clickhouse/5_Clickhouse-copier源码剖析.md)
 - [MergeTree 的写入流程](Clickhouse/6_MergeTree的写入流程.md)
+
+## 源码分析工具
+
+- [源码跟踪与文档发布 Skill](skills/trace-source-code/SKILL.md)

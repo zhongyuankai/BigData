@@ -131,7 +131,7 @@ rerouteStrategy.execute(allocation);
 4. gateway 认领但仍在 fetching/delayed 的 shard 已进入 `ignored`。
 5. gateway 返回 `NOT_TAKEN` 的 shard 仍留在主 `unassigned` 列表，等待 desired-balance。
 
-这也是 `DesiredBalanceInput` 必须额外保存 ignored shard 的原因。详细的 existing allocator 前置链路见：[`allocateExistingUnassignedShards` 源码跟踪](allocate-existing-unassigned-shards-source-trace.md)。
+这也是 `DesiredBalanceInput` 必须额外保存 ignored shard 的原因。详细的 existing allocator 前置链路见：[`allocateExistingUnassignedShards` 源码跟踪](<allocateExistingUnassignedShards 源码跟踪.md>)。
 
 常见调用位置：
 

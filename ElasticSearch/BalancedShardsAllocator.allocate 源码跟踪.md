@@ -168,7 +168,7 @@ rerouteStrategy.execute(allocation);
 - fetching、delayed 或仍由 existing allocator 负责的 shard 可能已经进入 ignored 列表。
 - existing allocator 返回 `NOT_TAKEN` 的 shard 仍在普通 unassigned 列表中。
 
-详细前置链路见 [`allocateExistingUnassignedShards()` 源码跟踪](allocate-existing-unassigned-shards-source-trace.md)。
+详细前置链路见 [`allocateExistingUnassignedShards()` 源码跟踪](<allocateExistingUnassignedShards 源码跟踪.md>)。
 
 ### 5.1 `balanced` 模式的 listener
 
@@ -1444,9 +1444,9 @@ nodes.size() >= 2
 | allocator 主测试 | [`BalancedShardsAllocatorTests.java`](../server/src/test/java/org/elasticsearch/cluster/routing/allocation/allocator/BalancedShardsAllocatorTests.java) |
 | factor 配置测试 | [`BalanceConfigurationTests.java`](../server/src/test/java/org/elasticsearch/cluster/routing/allocation/BalanceConfigurationTests.java) |
 | 单 shard rebalance 测试 | [`BalancedSingleShardTests.java`](../server/src/test/java/org/elasticsearch/cluster/routing/allocation/BalancedSingleShardTests.java) |
-| existing allocator 前置链路 | [`allocateExistingUnassignedShards` 跟踪](allocate-existing-unassigned-shards-source-trace.md) |
-| 全局 balance 架构 | [分片 Balance 源码跟踪](shard-balance-source-trace.md) |
-| desired allocator 入口 | [`DesiredBalanceShardsAllocator.allocate` 跟踪](desired-balance-shards-allocator-allocate-source-trace.md) |
+| existing allocator 前置链路 | [`allocateExistingUnassignedShards` 跟踪](<allocateExistingUnassignedShards 源码跟踪.md>) |
+| 全局 balance 架构 | [分片 Balance 源码跟踪](<Elasticsearch 分片 Balance 源码跟踪.md>) |
+| desired allocator 入口 | [`DesiredBalanceShardsAllocator.allocate` 跟踪](<DesiredBalanceShardsAllocator.allocate 源码跟踪.md>) |
 
 ## 37. 一句话心智模型
 

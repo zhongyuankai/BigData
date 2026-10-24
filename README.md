@@ -65,6 +65,7 @@
 
 ## Elasticsearch
 
+- [Master 选举源码跟踪](<ElasticSearch/Master 选举源码跟踪.md>)
 - [`ReplicationTracker` 源码跟踪：从副本加入到 global checkpoint 推进](<ElasticSearch/ReplicationTracker 源码跟踪：从副本加入到 global checkpoint 推进.md>)
 - [Retention Lease 理解及源码跟踪](<ElasticSearch/Retention Lease 理解及源码跟踪.md>)
 - [`NodeStats` 源码跟踪](<ElasticSearch/NodeStats 源码跟踪.md>)

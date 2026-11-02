@@ -2,8 +2,6 @@
 
 ## 1. 分析范围与核心作用
 
-本文跟踪本地 `lucene-didi` 仓库提交 `79d0f05ced9b679a0e7514b88fb290848bfdc61a` 的实现，不将其他 Lucene 版本的行为混入本文。源码根目录为 `/Users/didi/zyk/code/IDEAProjects/lucene-didi`。下文源码位置均相对于该目录；为便于阅读，Java 源文件统一使用 `lucene/core/src/java/org/apache/lucene/` 前缀，测试使用 `lucene/core/src/test/org/apache/lucene/` 前缀。
-
 `LRUQueryCache` 解决的是重复执行无评分查询时，反复计算相同匹配集合的开销。它保存的是 **Query 在某个 Segment core 上匹配的局部 doc ID 集合与数量**，不保存最终 TopN、文档内容或相关性分数。
 
 整体过程是：

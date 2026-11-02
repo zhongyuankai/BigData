@@ -1,158 +1,278 @@
 # LRUQueryCache 实现跟踪
 
-## 1. 分析范围与核心作用
+## 1. 先看它到底省了哪一步
 
-`LRUQueryCache` 解决的是重复执行无评分查询时，反复计算相同匹配集合的开销。它保存的是 **Query 在某个 Segment core 上匹配的局部 doc ID 集合与数量**，不保存最终 TopN、文档内容或相关性分数。
-
-整体过程是：
+假设商品搜索有两个条件：
 
 ```text
-IndexSearcher.createWeight
-  → 对不需要评分的 Weight 调用 LRUQueryCache.doCache
-  → CachingWrapperWeight
-  → 按 Segment 检查资格、查找缓存
-      → 命中：从 DocIdSet 创建无评分的 Scorer
-      → 未命中且值得缓存：完整收集匹配集合，写入缓存
-          → 插入后检查容量，按 Query 淘汰所有 Segment 上的对应集合
-      → 不适合缓存：委托原 Weight 执行
-  → 外层搜索用当前 liveDocs 排除删除文档
+关键词包含“手机” AND 价格在 100～200 元之间
 ```
 
-核心入口证据：`search/IndexSearcher.java:898`、`search/LRUQueryCache.java:474`、`search/LRUQueryCache.java:724`、`search/IndexSearcher.java:763`。
+关键词决定商品与搜索词有多相关，需要评分。价格只决定商品能不能留下，是过滤条件。
 
-## 2. 贯穿案例：重复使用价格范围过滤
+下一次用户搜索“耳机”，价格范围仍是 100～200 元。关键词部分需要重新计算，但价格过滤能不能直接复用？`LRUQueryCache` 就用来做这件事：**记住一个查询条件匹配了哪些文档，下次遇到相同条件，直接遍历已保存的文档集合。**
 
-设搜索请求包含一个需要评分的关键词条件，以及过滤条件 Q：
+例如，在某个 Segment 中，价格过滤匹配的文档编号是：
 
 ```text
-MUST   关键词查询（每次请求可以不同）
-FILTER Q = LongPoint.newRangeQuery("price", 100, 200)
+Q：价格在 100～200 元之间
+计算结果：{3, 7, 12, ...}
+
+缓存前：执行 Q → 查找满足价格范围的文档 → 得到这些编号
+缓存后：查缓存 → 直接得到这些编号
 ```
 
-固定以下条件，避免把示意过程误当作所有查询都必然发生的行为：
+这里保存的是文档编号集合，不是商品内容，也不是最终搜索结果。关键词评分、与其他条件求交集、排序，仍要继续进行。实现中的结果对象叫 `CacheAndCount`，其中保存 `DocIdSet` 和匹配数量。源码：`LRUQueryCache.java:949`。
 
-- 索引有两个 Segment：S1 的 `maxDoc = 20000`，S2 的 `maxDoc = 30000`；没有删除文档。
-- 使用 `new LRUQueryCache(2, 1024 * 1024)` 和默认 `UsageTrackingQueryCachingPolicy`。
-- 请求连续执行，每次重新创建 Weight；历史窗口中没有其他查询干扰，也不发生锁竞争。
-- Q 的 Weight 在两个 Segment 都可缓存，并提供 core cache helper；执行没有触发成本跳过。
-- 为解释集合表示，假设 Q 在 S1 上的 scorer 估算 cost 为 400，并实际匹配 400 个文档；S2 上估算 cost 为 100，实际匹配 100 个文档。
+读主流程时先记住三个名字即可：
 
-选择 Point 范围查询有一个实际原因：默认策略把它视为成本较高的查询，近期使用两次便允许缓存；普通 `TermQuery` 则被默认策略明确排除。前一轮用“状态 = 上架”说明过滤复用的原理，如果它实际是 `TermQuery`，还需要自定义缓存策略才会单独缓存。
-
-证据：`search/UsageTrackingQueryCachingPolicy.java:33`、`search/UsageTrackingQueryCachingPolicy.java:56`、`search/UsageTrackingQueryCachingPolicy.java:124`。
-
-## 3. 初始化：两个维度的缓存与一个全局 LRU
-
-### 3.1 配置的含义
-
-| 配置 | 当前实现的含义 |
+| 名字 | 在这条流程里负责什么 |
 | --- | --- |
-| `maxSize` | 最多保存多少个不同 Query，不是 `(Query, Segment)` 条目数 |
-| `maxRamBytesUsed` | 缓存记账的内存上限，插入后检查并淘汰 |
-| `leavesToCache` | 判断当前 Segment 是否值得缓存 |
-| `skipCacheFactor` | 在 `ScorerSupplier.get(leadCost)` 路径控制是否值得完整构建集合 |
+| `Query` | 描述查什么，例如价格范围 Q |
+| `Weight` | 为当前搜索准备查询执行逻辑，能够在每个 Segment 上创建执行器 |
+| `Scorer` / `BulkScorer` | 实际找出匹配文档；前者提供逐文档推进能力，后者负责批量收集 |
 
-两参数构造器实际使用 `MinSegmentSizePredicate(10000)` 和 `skipCacheFactor = 10`。Segment 必须同时满足：
-
-```text
-segment.maxDoc >= 10000
-segment.maxDoc * 2 > 顶层 reader.maxDoc / Segment 数量
-```
-
-除法是整数除法，使用的都是 `maxDoc`，包括尚未物理移除的删除文档。案例中平均值为 25000，S1、S2 均通过。
-
-另外，`shouldCache(context)` 会估算整个顶层 reader 的最坏 bitset 大小，并要求：
+缓存介入的位置是：**包装 Weight，让它创建执行器前先查缓存。**
 
 ```text
-(topLevelReader.maxDoc / 8) * 5 < maxRamBytesUsed
+创建查询执行计划
+  → 用 CachingWrapperWeight 包装可缓存的 Weight
+  → 执行到某个 Segment
+  → 查缓存
+      命中：用缓存集合创建执行器
+      未命中：按原逻辑计算，必要时保存集合
+  → 继续过滤、评分与收集
 ```
 
-案例中为 `50000 / 8 * 5 = 31250 < 1048576`。这是防止单次构建挤爆缓存的启发式门槛，不是精确对象内存测量。
+入口见 `IndexSearcher.java:898`，包装逻辑见 `LRUQueryCache.java:474`。
 
-证据：`search/LRUQueryCache.java:118`、`search/LRUQueryCache.java:147`、`search/LRUQueryCache.java:160`、`search/LRUQueryCache.java:695`、`search/LRUQueryCache.java:717`。
+## 2. 从一次真实搜索走到缓存命中
 
-`IndexSearcher` 自带的默认实例允许 1000 个 Query，内存取 32 MiB 与最大堆的 5% 中较小者；这与案例的自定义参数不同。证据：`search/IndexSearcher.java:92`。
+以下始终使用同一个过滤条件：
 
-### 3.2 为什么有三张 Map
+```java
+Query q = LongPoint.newRangeQuery("price", 100, 200);
+```
+
+先只看一个 Segment S1，假设它有 20000 个文档，Q 匹配其中 400 个。它满足缓存的大小和内存要求，执行过程没有锁竞争。每次搜索都新建查询执行计划，缓存实例与默认缓存策略则持续复用。
+
+默认策略认为 Point 范围查询值得较早缓存：在近期使用记录中出现两次后，便允许保存结果。因此下面会看到“第一次计算、第二次保存、第三次复用”。这不是所有 Query 统一的次数规则。源码：`UsageTrackingQueryCachingPolicy.java:45`、`UsageTrackingQueryCachingPolicy.java:124`。
+
+### 2.1 进入缓存：外层搜索需要评分，价格过滤不需要
+
+`IndexSearcher.createWeight` 的判断很直接：
+
+```java
+Weight weight = query.createWeight(this, scoreMode, boost);
+if (scoreMode.needsScores() == false && queryCache != null) {
+  weight = queryCache.doCache(weight, queryCachingPolicy);
+}
+```
+
+关键是 `scoreMode.needsScores() == false`。
+
+外层 BooleanQuery 虽然需要关键词评分，但 `BooleanWeight` 为 `FILTER` 子句创建 Weight 时，会传入 `COMPLETE_NO_SCORES`。因此价格 Q 可以进入缓存，关键词的正常评分流程继续保留。`MUST_NOT` 子句也是非评分子句。源码：`BooleanWeight.java:52`、`IndexSearcher.java:898`。
+
+`doCache` 返回一个 `CachingWrapperWeight`，内部仍保留原 Weight，下面称它为 `in`：
 
 ```text
-uniqueQueries: LinkedHashMap<Query, Query>，按访问顺序排列
-  Q 的等价对象 → Q 的规范实例
-
-cache: IdentityHashMap<CoreCacheKey, LeafCache>
-  S1.coreKey → LeafCache(S1)
-  S2.coreKey → LeafCache(S2)
-
-LeafCache.cache: IdentityHashMap<Query, CacheAndCount>
-  Q 的规范实例 → { DocIdSet, count }
+CachingWrapperWeight
+  ├─ in：原来的查询执行逻辑，缓存用不了时继续调用它
+  └─ policy：判断一个查询值不值得新建缓存
 ```
 
-`uniqueQueries` 使用 Query 的 `equals/hashCode` 识别等价查询，并返回统一的实例。LeafCache 随后按对象身份查找，避免在每个 Segment 中持有等价 Query 的多个副本。`mostRecentlyUsedQueries` 是第一张 Map 的 `keySet` 视图，并非另一个独立维护的集合。
+这一步只加包装，还没有计算 400 个文档。源码：`LRUQueryCache.java:474`、`LRUQueryCache.java:683`。
 
-这里的不变式是：任意 LeafCache 中的 Query 都必须属于全局 Query 集合。因此插入、淘汰、清理必须用同一把锁同步。
+### 2.2 第一次搜索：查不到，也暂时不保存
 
-证据：`search/LRUQueryCache.java:88`、`search/LRUQueryCache.java:132`、`search/LRUQueryCache.java:292`、`search/LRUQueryCache.java:623`。
+先沿批量执行入口 `CachingWrapperWeight.bulkScorer(S1)` 阅读。`IndexSearcher` 遍历 Segment 搜索时会调用这个入口。源码：`IndexSearcher.java:763`。
 
-## 4. 入口：为什么关键词仍评分，过滤条件可以缓存
+它先调用 `policy.onUse(Q)`，让策略记下“Q 用过一次”。包装 Weight 用 `AtomicBoolean used` 保证同一执行计划只登记一次，不会因为访问多个 Segment 就重复增加查询使用次数。源码：`LRUQueryCache.java:891`。
 
-`IndexSearcher.createWeight` 先调用 Query 自身的 `createWeight`，随后只有在 `scoreMode.needsScores() == false` 且缓存非空时，才调用 `queryCache.doCache`。
+随后检查这个 Segment 能不能使用缓存，检查通过才查找 Q 的结果。此时缓存为空，得到 miss。
 
-外层 BooleanQuery 即使需要评分，`BooleanWeight` 创建子 Weight 时也会将非评分子句切换为 `COMPLETE_NO_SCORES`。因此案例的关键词沿评分路径执行，Q 可以进入缓存包装；`MUST_NOT` 同样属于非评分子句。
+代码接着询问 `policy.shouldCache(Q)`。默认策略中 Q 的使用次数只有 1，还没达到门槛，于是调用：
 
-`ConstantScoreQuery` 则通过无评分模式创建内部 Query 的 Weight，再按外层需要提供常量分数。缓存所服务的始终是内部匹配集合。
+```java
+return in.bulkScorer(context);
+```
 
-证据：`search/IndexSearcher.java:898`、`search/BooleanWeight.java:52`、`search/ConstantScoreQuery.java:125`。
+也就是交回原 Weight，正常计算价格范围的匹配文档。
 
-`doCache` 本身不遍历文档。它先剥离已有的 `CachingWrapperWeight`，再创建新的包装 Weight，实际动作延迟到具体 Segment 执行时。`matches` 仍委托原 Weight，并不从 bitset 还原匹配位置信息。
+**第一次搜索结束：结果正常返回，Q 没有被存入缓存。** 查找与分支见 `LRUQueryCache.java:918`。
 
-证据：`search/LRUQueryCache.java:474`、`search/LRUQueryCache.java:683`、`search/LRUQueryCache.java:691`。
+### 2.3 第二次搜索：计算一次完整结果，并存下来
 
-## 5. 第一次请求：先统计使用，再决定是否建立缓存
+第二次搜索创建新的包装 Weight，执行到 S1 时再次登记 Q。策略中 Q 的使用次数达到 2。
 
-以 `CachingWrapperWeight.scorerSupplier(context)` 为主线，其执行顺序如下。
+缓存依然 miss，但这次 `policy.shouldCache(Q)` 返回 true，进入：
 
-### 5.1 每个包装 Weight 只报告一次使用
+```java
+cached = cache(context);
+putIfAbsent(in.getQuery(), cached, cacheHelper);
+```
 
-`used.compareAndSet(false, true)` 成功后调用 `policy.onUse(getQuery())`。同一包装 Weight 被两个 Segment、多个线程或不同入口访问，不会重复报告使用。
+这两句分别完成“生成集合”和“保存集合”。源码：`LRUQueryCache.java:925`。
 
-这不是“每个 Segment 访问一次就增加一次查询频次”。案例第一次请求处理 S1 时 Q 频次变成 1，随后处理 S2 不再增加；第二次请求创建新的包装 Weight 后才增加为 2。
+`cache(context)` 先取得原 Weight 的 `BulkScorer`，再交给 `cacheImpl`。`cacheImpl` 遍历 Q 的全部匹配文档，将编号收集到集合中：
 
-默认策略只在大小为 256 的近期使用窗口里记录 Query 的 hash code，不持有 Query 引用。它使用同步块保护频率环形缓冲区。Hash 碰撞最多使某个查询提前达到缓存门槛，不会让缓存返回另一个查询的结果，因为真正缓存仍依赖 Query 等价判断。
+```text
+原执行器依次找出：3、7、12、……，共 400 个
+                  ↓
+CacheAndCount {
+  cache = 保存这 400 个编号的 DocIdSet
+  count = 400
+}
+```
 
-默认门槛：成本较高的查询为 2，BooleanQuery / DisjunctionMaxQuery 为 4，其他可缓存查询为 5。TermQuery、FieldExistsQuery、MatchAllDocsQuery、MatchNoDocsQuery 以及空的上述复合查询被排除。
+若原执行器为 null，说明没有匹配，也会保存一个空结果，避免之后重复计算。源码：`LRUQueryCache.java:707`、`LRUQueryCache.java:501`。
 
-证据：`search/LRUQueryCache.java:675`、`search/LRUQueryCache.java:724`、`search/UsageTrackingQueryCachingPolicy.java:95`、`search/UsageTrackingQueryCachingPolicy.java:124`、`search/UsageTrackingQueryCachingPolicy.java:143`。
+`putIfAbsent` 再把结果挂到 S1 的缓存下，并检查是否需要淘汰旧 Query。集合构建发生在锁外，缓存结构的修改发生在锁内。源码：`LRUQueryCache.java:292`。
 
-### 5.2 查缓存前的快速退出
+**第二次搜索仍然付出了计算代价，但这次留下了以后可以复用的集合。** 当前搜索也直接使用刚生成的集合继续执行。
 
-| 检查顺序 | 条件 | 行为 |
-| --- | --- | --- |
-| 1 | 原 Weight 的 `isCacheable(context)` 为 false | 使用原 supplier |
-| 2 | 内存估算或 Segment 筛选未通过 | 使用原 supplier |
-| 3 | 无 `getCoreCacheHelper()` | 使用原 supplier |
-| 4 | `lock.tryLock()` 失败 | 不等待查询锁，使用原 supplier |
+### 2.4 第三次搜索：直接遍历缓存集合
 
-只有通过这些条件才调用 `get`。因此被这些分支跳过的访问不会计入缓存的 hit / miss。
+第三次查找时，S1 中已经有 Q 的 `CacheAndCount`，于是跳过原 Weight 的集合计算，取出缓存迭代器，创建：
 
-证据：`search/LRUQueryCache.java:729`、`search/LRUQueryCache.java:736`、`search/LRUQueryCache.java:740`、`search/LRUQueryCache.java:747`。
+```java
+new ConstantScoreScorer(this, 0f, ScoreMode.COMPLETE_NO_SCORES, disi)
+```
 
-### 5.3 get 的两层查找与 LRU 更新
+`disi` 就是遍历缓存文档编号的迭代器。这里的 0 分不会破坏关键词评分，因为这个执行器服务的是无评分的价格条件。源码：`LRUQueryCache.java:934`。
 
-`get` 先按 core key 找 LeafCache。没有则立即 miss。存在时再调用 `uniqueQueries.get(key)`，找到规范 Query 并将其移到 LRU 队尾，然后在 LeafCache 中按身份查匹配集合。
+到这里，三次执行的差别可以放在一张表里：
 
-有一个细节：LeafCache 存在、全局 Query 存在，但该 Query 尚未在此 Segment 建立集合时，也会更新全局 LRU，随后报告 miss；若 LeafCache 根本不存在，则不会走到 LRU 更新。
+| 搜索次数 | 策略记录的 Q 使用次数 | 缓存查找 | 是否计算价格匹配集合 | 是否保存集合 |
+| --- | --- | --- | --- | --- |
+| 第一次 | 1 | miss | 是 | 否 |
+| 第二次 | 2 | miss | 是 | 是 |
+| 第三次 | 3 | hit | 否，遍历已有集合 | 已有集合继续保留 |
 
-案例第一次执行时两个 Segment 都 miss。Q 的使用频次仅为 1，`policy.shouldCache(Q)` 返回 false，于是调用原 supplier 执行，不插入任何缓存。
+缓存带来的收益发生在第三次及后续复用中。实际执行如果不满足缓存资格、发生锁竞争或走了其他快速路径，过程可能不同。
 
-证据：`search/LRUQueryCache.java:267`、`search/LRUQueryCache.java:758`。
+## 3. 扩展到多个 Segment：为什么需要三张 Map
 
-## 6. 第二次请求：构建完整集合并写入
+Lucene 把索引划分成多个 Segment，每个 Segment 内部都有自己的文档编号。S1 的文档 7 与 S2 的文档 7 是不同文档，因此 Q 的结果必须分开存。
 
-### 6.1 成本门槛：不能为缓存把一个便宜查询拖慢
+假设再增加 S2，Q 在其中匹配 100 个文档：
 
-第二次执行 Q 时频次达到 2。未命中后策略允许缓存，代码先取得原 supplier，然后返回一个新的 supplier；此时集合还没有生成。
+```text
+S1：Q → 400 个局部文档编号
+S2：Q → 100 个局部文档编号
+```
 
-真正调用这个 supplier 的 `get(leadCost)` 时才判断：
+为了管理这些结果，源码分成两层：
+
+```text
+全局：管理哪些 Query 已经缓存，以及谁最近被访问
+  uniqueQueries：Q、R、……，按最近访问顺序排列
+
+每个 Segment：保存该 Segment 内的查询结果
+  cache
+    S1 的 core key → LeafCache
+                      Q → CacheAndCount(400 个文档)
+    S2 的 core key → LeafCache
+                      Q → CacheAndCount(100 个文档)
+```
+
+`core key` 是 Segment 底层核心的身份标识；`LeafCache` 就是一个 Segment 的缓存容器。**一个 Q 对应两个结果条目，所以 Query 数是 1，`cacheSize` 却是 2。** 源码：`LRUQueryCache.java:88`、`LRUQueryCache.java:623`。
+
+### 3.1 全局 Map 还有一个任务：统一等价 Query 的对象
+
+两次搜索往往各自创建一个价格 Query 对象。只要它们的 `equals/hashCode` 相同，全局 `uniqueQueries` 就把它们归到同一个代表对象上。各个 LeafCache 都使用这个代表对象作 key，因此 LeafCache 可以用 `IdentityHashMap` 按对象身份查找。
+
+可以将查找过程理解为：
+
+```text
+本次新建的价格 Q
+  → uniqueQueries：找到缓存中的等价 Q 对象
+  → S1 的 LeafCache：用这个对象找到 400 个文档的集合
+```
+
+具体实现会先确认当前 Segment 的 LeafCache 存在，再查全局 Query，最后查集合。源码：`LRUQueryCache.java:267`。
+
+### 3.2 putIfAbsent 具体改了什么
+
+第二次搜索保存 Q 时，按下面的顺序修改状态：
+
+1. 在全局 Map 中登记 Q，或复用已有的等价 Q 对象。
+2. 找到 S1 的 LeafCache；没有就创建，并注册 core 关闭时的清理回调。
+3. 向 LeafCache 插入 Q 的集合；已经有结果时不重复保存。
+4. 增加实际插入的条目数与内存记账。
+5. 检查容量，必要时执行 LRU 淘汰。
+
+源码：`LRUQueryCache.java:292`、`LRUQueryCache.java:651`。
+
+## 4. LRU 怎样淘汰：删一个 Query 的所有结果
+
+LRU 的意思是最近最少使用。实现依靠按访问顺序排列的 `LinkedHashMap`：
+
+```java
+uniqueQueries = new LinkedHashMap<>(16, 0.75f, true);
+```
+
+最后的 `true` 表示按访问顺序维护。`mostRecentlyUsedQueries` 是这张 Map 的 keySet 视图，并不是额外的一份 Query 列表。源码：`LRUQueryCache.java:132`。
+
+假设最多缓存两个 Query，左侧是最旧的，右侧是最近访问的：
+
+```text
+已有 Q、R：       [Q, R]
+再次访问 Q：     [R, Q]
+插入新 Query T： [R, Q, T]
+超过上限，淘汰 R：[Q, T]
+```
+
+淘汰 R 时，代码先移除全局 R，再遍历所有 LeafCache，删除 R 在每个 Segment 上的结果。Q 和 T 的结果不受影响。因此 `maxSize = 2` 限制的是不同 Query 数，不是结果集合数。源码：`LRUQueryCache.java:321`、`LRUQueryCache.java:381`。
+
+内存记账超过 `maxRamBytesUsed` 时也会触发同样的淘汰，直到满足约束。单次淘汰要遍历所有叶子缓存，因此把同一个缓存共享给很多 Segment 会增加清理成本。源码：`LRUQueryCache.java:257`。
+
+有个细节：某个 Segment 的 LeafCache 已存在时，`uniqueQueries.get(Q)` 会更新 Q 的最近访问位置，即使 Q 在该 Segment 上还没有结果、最终仍然 miss。因此这里的“使用”并不完全等同于“成功命中”。源码：`LRUQueryCache.java:267`。
+
+## 5. 哪些情况下会跳过缓存
+
+理解了主线，再看为什么实际搜索未必按“三次执行”的例子发展。
+
+### 5.1 不是所有查询都值得保存
+
+默认 `UsageTrackingQueryCachingPolicy` 维护最近 256 次使用记录，根据近期出现频次决定是否新建缓存：
+
+| Query 类型 | 默认策略 |
+| --- | --- |
+| Point 范围、MultiTermQuery 等成本较高的查询 | 出现至少 2 次 |
+| 非空 BooleanQuery、DisjunctionMaxQuery | 出现至少 4 次 |
+| 其他未被排除的查询 | 出现至少 5 次 |
+| TermQuery、FieldExistsQuery、MatchAllDocsQuery、MatchNoDocsQuery，以及空的上述复合查询 | 不新建缓存 |
+
+例如，单个词项过滤本来就能高效读取倒排表，再复制一份结果集合未必划算。这就是例子选择价格 Point 查询的原因。源码：`UsageTrackingQueryCachingPolicy.java:45`、`UsageTrackingQueryCachingPolicy.java:56`、`UsageTrackingQueryCachingPolicy.java:124`。
+
+这些频次是近期窗口里的次数，不是从进程启动以来永久累加的次数。策略只保存 hash code，允许极少数碰撞导致提前缓存；真正的结果查找仍使用 Query 等价关系。源码：`UsageTrackingQueryCachingPolicy.java:143`。
+
+策略控制的是 miss 后是否建立新条目，已经存在的结果仍可以命中。源码：`LRUQueryCache.java:925`。
+
+### 5.2 Segment 太小、内存不足或结果不稳定
+
+查缓存之前，还要检查：
+
+| 条件 | 为什么需要 |
+| --- | --- |
+| 原 Weight 的 `isCacheable` 为 true | 由具体查询确认结果适合按 core 缓存 |
+| Segment 通过大小筛选 | 避免为很小的 Segment 花费缓存管理成本 |
+| 内存估算通过 | 避免一个巨大集合挤掉大量旧缓存 |
+| reader 提供 core cache helper | 需要稳定的身份标识以及关闭清理回调 |
+| `tryLock` 成功 | 查找时不因锁争用而一直等待，失败则正常计算 |
+
+两参数构造器默认要求 Segment 的 `maxDoc >= 10000`，并且 `maxDoc * 2 > 顶层 maxDoc / Segment 数`。内存检查要求 `(顶层 maxDoc / 8) * 5 < maxRamBytesUsed`；这是为多个过滤集合预留空间的粗略估算。源码：`LRUQueryCache.java:147`、`LRUQueryCache.java:160`、`LRUQueryCache.java:695`。
+
+批量入口的检查见 `LRUQueryCache.java:896`。跳过这些检查时，流程交回原 Weight，查询仍正常执行；这类访问不会计入缓存 hit / miss。
+
+### 5.3 有时只检查少量候选文档，完整缓存反而更慢
+
+除了前面跟踪的 `bulkScorer`，包装 Weight 还提供 `scorerSupplier`。supplier 可以理解为“按调用方需要，稍后再创建 Scorer”的工厂。
+
+在组合查询里，其他条件可能已经把候选缩到 10 个。此时价格过滤只需验证少数候选，没必要为了缓存去完整找出全部匹配。
+
+因此 `ScorerSupplier.get(leadCost)` 在 miss 且策略允许后，还会检查：
 
 ```java
 if (cost / skipCacheFactor > leadCost) {
@@ -160,203 +280,106 @@ if (cost / skipCacheFactor > leadCost) {
 }
 ```
 
-假设 Q 的 cost 为 400，默认 factor 为 10，而其他条件使调用方传入的 `leadCost` 仅为 10，那么 `40 > 10`，本次跳过缓存。原因是组合查询可能只需检查少量候选文档，而建立缓存需要完整遍历 Q 的匹配。
+假设价格查询的估算 cost 为 400，默认 factor 为 10，调用方给的 leadCost 为 10，那么 `400 / 10 > 10`，本次交回原 supplier，跳过构建。通过检查才完整生成集合并插入。源码：`LRUQueryCache.java:759`。
 
-通过后调用 `supplier.get(Long.MAX_VALUE)`，以 `DefaultBulkScorer` 完整收集集合。案例假设通过该门槛。直接使用包装 Weight 的 `scorer(context)` 会以 `Long.MAX_VALUE` 请求 supplier；成本跳过主要发生在调用方传入有限 `leadCost` 的执行中。
+三个入口的区别归纳如下：
 
-如果原 supplier 为 null，则直接存入 `CacheAndCount.EMPTY` 并返回 null，后续也可以命中“没有结果”。
-
-证据：`search/LRUQueryCache.java:759`、`search/LRUQueryCache.java:769`、`search/LRUQueryCache.java:824`。
-
-### 6.2 按估算 cost 选择集合格式
-
-`cacheImpl` 以 `scorer.cost() * 100 >= maxDoc` 选择表示，并非先算实际命中率再选择。
-
-| Segment | 估算 cost | maxDoc | 选择 |
-| --- | --- | --- | --- |
-| S1 | 400 | 20000 | `40000 >= 20000`，`FixedBitSet`，外包 `BitDocIdSet` |
-| S2 | 100 | 30000 | `10000 < 30000`，`RoaringDocIdSet` |
-
-bitset 适合较密集集合并支持快速随机访问；Roaring 适合较稀疏集合。两条构建路径都只收集 doc ID，不使用 score，并同时产生数量 `count`。构建时传入 `acceptDocs = null`，即集合不主动过滤当前删除标记。
-
-证据：`search/LRUQueryCache.java:501`、`search/LRUQueryCache.java:511`、`search/LRUQueryCache.java:530`、`search/LRUQueryCache.java:949`。
-
-### 6.3 putIfAbsent 的状态变化
-
-构建完成后，`putIfAbsent` 在锁内依次执行：
-
-1. 向 `uniqueQueries` 登记 Q；如果已有等价 Query，改用已有规范实例。
-2. 按 core key 找到或创建 LeafCache。
-3. 新建 LeafCache 时向 core cache helper 注册 `clearCoreCacheKey` 关闭监听器。
-4. 在 LeafCache 中按规范 Q 插入集合；只有真正插入才增加条目数和内存。
-5. 调用 `evictIfNecessary()`，把超限缓存降下来。
-
-案例先在 S1 插入 Q，再在 S2 插入 Q。最终全局 Query 数是 1，而 `cacheSize` 是 2。两者不能混淆。
-
-证据：`search/LRUQueryCache.java:292`、`search/LRUQueryCache.java:651`。
-
-缓存建立后，当前请求也直接使用刚刚生成的集合，返回 `ConstantScoreScorer(..., 0f, COMPLETE_NO_SCORES, iterator)`。
-
-证据：`search/LRUQueryCache.java:775`。
-
-## 7. 第三次请求与其他执行入口
-
-### 7.1 命中时只生成迭代器
-
-第三次请求在每个 Segment 找到 `CacheAndCount`，增加 hit，从集合取迭代器并创建无评分 Scorer；不再调用原 Weight 重新计算 Q 的完整集合。缓存是 `EMPTY` 或 iterator 为 null 时返回 null，表示该 Segment 无匹配。
-
-`policy.shouldCache` 仅在 miss 后调用，因此策略后来不再允许新建缓存，也不会禁止复用已存在的条目。
-
-证据：`search/LRUQueryCache.java:758`、`search/LRUQueryCache.java:800`；测试 `search/TestLRUQueryCache.java:707` 的第三轮将策略切为 `NEVER_CACHE`，仍断言旧条目命中。
-
-### 7.2 bulkScorer 路径并不经过成本倍数判断
-
-普通 Segment 搜索从 `IndexSearcher` 调用 `weight.bulkScorer(ctx)`。包装类覆盖了这个入口，也有自己的使用登记、资格检查、tryLock 查找流程。
-
-miss 且策略允许时，它直接调用 `cache(context)`，后者调用原 `in.bulkScorer(context)` 并生成集合，然后写入缓存。最后使用缓存迭代器包装 `DefaultBulkScorer`。
-
-**这条路径没有 `cost / skipCacheFactor > leadCost` 的判断。** 不能把 supplier 路径的跳过规则说成所有入口统一执行的规则。
-
-证据：`search/IndexSearcher.java:763`、`search/LRUQueryCache.java:707`、`search/LRUQueryCache.java:891`。
-
-### 7.3 count 路径只查已有缓存
-
-`count(context)` 按下面的顺序处理：
-
-1. 先调用原 `in.count(context)`；如果结果不是 -1，直接采用其快速计数。
-2. 原 Weight 无法快速计数时，有删除文档则返回 -1。
-3. 否则进行使用登记、资格检查与 tryLock 查缓存。
-4. 命中则返回 `cached.count()`，未命中返回 -1，不主动构建。
-
-这里 -1 表示“无法快速计数”，不是匹配数为零。外层可继续走普通收集流程。因此并不是调用 `IndexSearcher.count` 就一定能建立或命中缓存；底层快速计数可能直接结束。
-
-证据：`search/LRUQueryCache.java:832`。
-
-### 7.4 案例状态汇总
-
-仅统计 Q 的两段访问，假定没有其他缓存条目与统计干扰：
-
-| 阶段 | Q 在近期窗口中的频次 | 全局 Query 数 | cacheSize | 累计 miss | 累计 hit | 累计 cacheCount |
-| --- | --- | --- | --- | --- | --- | --- |
-| 初始 | 0 | 0 | 0 | 0 | 0 | 0 |
-| 第一次执行后 | 1 | 0 | 0 | 2 | 0 | 0 |
-| 第二次执行后 | 2 | 1 | 2 | 4 | 0 | 2 |
-| 第三次执行后 | 3 | 1 | 2 | 4 | 2 | 2 |
-
-## 8. 淘汰：以 Query 为单位跨 Segment 删除
-
-`requiresEviction()` 检查全局 Query 数超过 `maxSize`，或内存记账超过 `maxRamBytesUsed`。`evictIfNecessary()` 从访问顺序 Map 的最旧端取 Query，将它从全局集合移除，再通过 `onEviction` 遍历所有 LeafCache 删除相应集合。
-
-案例中随后建立另一个 Query R 的缓存，LRU 顺序为 `[Q, R]`；再次命中 Q 后变为 `[R, Q]`；插入第三个 Query T，顺序暂为 `[R, Q, T]`。因 `maxSize = 2`，淘汰 R 在所有 Segment 中的集合，留下 `[Q, T]`。
-
-因此淘汰既不是选某个 Segment，也不是只删除一个 `(Query, Segment)` 条目。单次 Query 淘汰要遍历所有已登记 LeafCache，代价随这类 Segment 数量增长。
-
-淘汰后空 LeafCache 仍可能留在外层 Map，直至 core 关闭或整体 clear。容量限制主要约束稳定存储状态；完整集合在锁外创建，并发构建和插入前的临时对象也可能额外占用内存，不能把配置当作整个进程此时的绝对内存上限。
-
-证据：`search/LRUQueryCache.java:257`、`search/LRUQueryCache.java:321`、`search/LRUQueryCache.java:381`、`search/LRUQueryCache.java:660`。
-
-## 9. 生命周期：删除、刷新与 Segment 关闭
-
-### 9.1 删除文档为什么不会让旧集合返回错误结果
-
-缓存按 core key 绑定，构建时也不应用当前 liveDocs。正常搜索收集时，`IndexSearcher` 才将 `ctx.reader().getLiveDocs()` 传给 BulkScorer；`Weight.DefaultBulkScorer` 据此跳过删除文档。
-
-若 S1 上缓存包含局部 doc ID 7，随后该文档被删除，但新 reader 仍共享同一 core，则旧集合可以继续使用，收集时 doc 7 被过滤。这里的前提是 reader 共享 core 且原 Weight 仍声明可缓存；仅凭“发生刷新”不能判断缓存必然可复用或必然失效。
-
-数量缓存不能直接应用这个掩码，因此 `count` 在原 Weight 不能快速计数且 reader 有删除时拒绝返回缓存 count。
-
-证据：`search/LRUQueryCache.java:514`、`search/IndexSearcher.java:769`、`search/Weight.java:313`、`search/LRUQueryCache.java:840`。
-
-### 9.2 三类清理各自删什么
-
-| 操作 | 清理范围 | 全局 Query 是否随之移除 |
-| --- | --- | --- |
-| `clearCoreCacheKey(coreKey)` | 一个 core 的整个 LeafCache 与其集合记账 | 否 |
-| `clearQuery(query)` | 一个 Query 及其在所有 LeafCache 中的集合 | 是 |
-| `clear()` | 所有 LeafCache、所有全局 Query，当前内存与条目归零 | 是 |
-
-core 的关闭监听器在第一次创建 LeafCache 时注册。Segment 合并得到新 core，要按新 core 建立缓存；旧 core 真正关闭后清理旧条目，不是“合并一开始就清空”。一个 core 被移除后，全局 Query 可能暂时没有任何叶子条目，仍留在 LRU 中直到后续清理或淘汰。
-
-DocValues 更新影响查询结果时，正确性还依赖原 Weight 的 `isCacheable`。不能认为同一 core 下所有数据变化都天然安全；现有测试展示了更新后的相关查询绕过缓存。
-
-证据：`search/LRUQueryCache.java:312`、`search/LRUQueryCache.java:349`、`search/LRUQueryCache.java:369`、`search/LRUQueryCache.java:390`、`search/TestLRUQueryCache.java:1734`。
-
-## 10. 并发、异常与统计边界
-
-查询查找用 `tryLock`，争用时退回原计算；插入、淘汰、清理则使用 `lock.lock()`。因此“整个缓存绝不等待锁”是不准确的。完整集合构建在查找锁释放后执行，避免长时间占锁，但也允许多个线程同时发现 miss 并重复构建同一集合；最终插入靠两层 `putIfAbsent` 去重。实现没有按键合并构建任务或异步加载任务。
-
-统计字段为 volatile；更新依靠锁，读取无需锁。一次读取多个 getter 不是全局原子快照。
-
-| 指标 | 含义 |
+| 入口 | miss 时的行为 |
 | --- | --- |
-| `hitCount` / `missCount` | 真正进入 get 的逐 Segment 命中 / 未命中次数 |
-| `totalCount` | hit + miss，不是用户搜索请求数 |
-| `cacheSize` | 当前 `(Query, core)` 集合条目数，空结果条目也计数 |
-| `cacheCount` | 历史真正插入的集合条目数 |
-| `evictionCount` | `cacheCount - cacheSize`，含手工清理与 core 关闭等移除 |
-| `ramBytesUsed` | Query、Map 条目及集合的记账内存；普通 Query 使用默认估算，可 Accountable 的 Query 使用自身报告值 |
+| `bulkScorer` | 策略允许就完整构建，不做上面的 leadCost 比较 |
+| `scorerSupplier` | 策略允许后，创建 Scorer 时还可能因成本跳过 |
+| `count` | 只查询已有集合，不主动构建；返回 -1 表示不能快速计数 |
 
-`clear()` 只归零当前内存、当前条目；历史 hit、miss、cacheCount 不清零。因此不能把 `getEvictionCount()` 当作仅由 LRU 容量不足触发的淘汰数。
+`count` 会先尝试原 Weight 自带的快速计数，成功就直接返回；失败后才考虑缓存，并且有删除文档时不使用缓存数量。源码：`LRUQueryCache.java:724`、`LRUQueryCache.java:832`、`LRUQueryCache.java:891`。
 
-异常边界：
+## 6. 集合怎样存，删除后为什么还能用
 
-- `skipCacheFactor < 1` 或 NaN 在构造时抛出 `IllegalArgumentException`。
-- Query 入缓存后若修改了参与 hash 的状态，淘汰检测到异常时可能抛出 `ConcurrentModificationException`；必须保持键的等价与 hash 稳定。
-- 原 Weight、策略、集合迭代或构建产生的 `IOException` 按调用链传播，没有统一吞掉并自动重试。构建失败时尚未插入该次生成的完整集合；这不是整个搜索的事务回滚保证。
-- 回调在锁内同步执行。扩展统计回调应避免耗时操作；覆盖基础回调时若要保留原始记账，还需调用父类实现。
+### 6.1 集合格式由估算 cost 决定
 
-证据：`search/LRUQueryCache.java:126`、`search/LRUQueryCache.java:179`、`search/LRUQueryCache.java:250`、`search/LRUQueryCache.java:296`、`search/LRUQueryCache.java:331`、`search/LRUQueryCache.java:403`、`search/LRUQueryCache.java:549`、`search/LRUQueryCache.java:747`。
+缓存不会简单保存一长串 Java 文档对象，而是选择适合文档编号集合的数据结构：
 
-## 11. 相关测试：用于对照哪些行为
+```text
+scorer.cost() * 100 >= Segment.maxDoc
+  是 → FixedBitSet，以位标记文档是否匹配
+  否 → RoaringDocIdSet，压缩保存较稀疏的编号集合
+```
 
-本次阅读了相关测试源码，未运行构建或测试；下表是已有断言的覆盖范围，不代表本次执行结果。
+例如 S1 有 20000 个文档，估算 cost 为 400，则走 bitset。这里使用估算 cost，而不是先统计实际命中率再选择格式。源码：`LRUQueryCache.java:501`。
 
-| 测试与位置 | 对应验证点 |
+### 6.2 删除文档后，搜索阶段再排除它
+
+假设 Q 的缓存中包含文档 7，后来文档 7 被删除。若新 reader 仍共享同一个 core，且查询仍可缓存，旧集合可以保留：
+
+```text
+缓存集合：{3, 7, 12, ...}
+当前 liveDocs：文档 7 已删除
+实际收集：{3, 12, ...}
+```
+
+原因是构建集合时不传删除过滤条件；实际搜索时，`IndexSearcher` 将当前 `liveDocs` 传给执行器，收集时排除被删除的编号。源码：`LRUQueryCache.java:511`、`IndexSearcher.java:769`、`Weight.java:313`。
+
+缓存中的 count 仍可能包含已删除文档，因此不能直接返回它作为当前数量。这正是 `count` 路径有删除时拒绝使用缓存数量的原因。源码：`LRUQueryCache.java:840`。
+
+### 6.3 core 关闭才清理对应结果
+
+创建 LeafCache 时，缓存会注册 core 关闭回调。旧 core 真正关闭时，`clearCoreCacheKey` 移除它的整个 LeafCache。Segment 合并会产生新的 core，新 core 需要建立自己的结果。
+
+手工清理则有两个入口：`clearQuery(Q)` 删除 Q 在所有 Segment 中的结果；`clear()` 清空整个缓存。只清理一个 core 时，全局 Q 可以继续保留。源码：`LRUQueryCache.java:312`、`LRUQueryCache.java:349`、`LRUQueryCache.java:369`、`LRUQueryCache.java:390`。
+
+DocValues 更新属于另一种情况：它可能改变查询结果，不能只靠删除过滤保证正确。相关查询还要通过原 Weight 的 `isCacheable` 判断，更新后不适合缓存时绕过旧集合。已有回归测试见 `TestLRUQueryCache.java:1734`。
+
+## 7. 并发、统计与异常：读源码时的补充
+
+查找使用 `tryLock`，失败就正常计算；插入与清理使用阻塞锁。集合在锁外生成，所以两个线程可能同时 miss、同时计算；最终通过 `putIfAbsent` 只保留一份条目。这种设计缩短了持锁时间，但不保证同一个结果只计算一次。源码：`LRUQueryCache.java:292`、`LRUQueryCache.java:747`。
+
+内存限制约束的是缓存记账，并不覆盖锁外并发构建时的全部临时内存。普通 Query 的大小使用默认估算，实现了 `Accountable` 的 Query 使用自身报告值。源码：`LRUQueryCache.java:403`。
+
+最容易误读的几个统计值是：
+
+| 指标 | 应怎样理解 |
 | --- | --- |
-| `testLRUEviction`，`search/TestLRUQueryCache.java:237` | Query 访问顺序与容量淘汰 |
-| `testOnUse`，`search/TestLRUQueryCache.java:633` | onUse 的调用语义 |
-| `testStats`，`search/TestLRUQueryCache.java:707` | 分 Segment 的统计、策略禁止新建时继续命中、关闭时移除 |
-| `testBooleanQueryCachesSubClauses`，`search/TestLRUQueryCache.java:1009` | 评分查询中的 FILTER / MUST_NOT 可被包装缓存；使用自定义 ALWAYS_CACHE |
-| `testDetectMutatedQueries`，`search/TestLRUQueryCache.java:1211` | 修改缓存键的异常检测 |
-| `testRefuseToCacheTooLargeEntries`，`search/TestLRUQueryCache.java:1246` | 内存容量资格门槛 |
-| `testMinSegmentSizePredicate`，`search/TestLRUQueryCache.java:1428` | 最小 Segment 筛选 |
-| `testReaderNotSuitedForCaching`，`search/TestLRUQueryCache.java:1509` | 不支持缓存的 reader 路径 |
-| `testQueryNotSuitedForCaching`，`search/TestLRUQueryCache.java:1572` | 原 Weight 不可缓存的路径 |
-| `testDocValuesUpdatesDontBreakCache`，`search/TestLRUQueryCache.java:1734` | DocValues 更新后相关查询不再使用旧缓存 |
-| `testQueryCacheSoftUpdate`，`search/TestLRUQueryCache.java:1802` | 全部文档被软删除后旧 Segment 被丢弃，条目随生命周期清理 |
-| `testSkipCachingForRangeQuery`，`search/TestLRUQueryCache.java:1923` | 不同 factor 对 supplier 构建的影响 |
-| `testCacheHasFastCount`，`search/TestLRUQueryCache.java:2057` | 填充后快速计数，有删除时不能返回缓存数量 |
-| `testNeverCacheTermFilter`，`search/TestUsageTrackingFilterCachingPolicy.java:50` | 默认策略不缓存 TermQuery |
-| `testBooleanQueries`，`search/TestUsageTrackingFilterCachingPolicy.java:68` | 复合查询的频率门槛 |
+| `hitCount` / `missCount` | 按 Segment 的真实查找次数，不是用户请求数 |
+| `cacheSize` | 当前结果集合数；一个 Query 在两个 Segment 缓存，计为 2 |
+| `cacheCount` | 历史真正插入过的集合数 |
+| `evictionCount` | `cacheCount - cacheSize`，也包括关闭与手工清理造成的移除 |
 
-## 12. 源码审阅发现
+`clear()` 归零当前条目与内存，不重置历史 hit、miss 和 cacheCount。源码：`LRUQueryCache.java:250`、`LRUQueryCache.java:549`。
 
-### 12.1 构造器注释与实现有差异
+异常方面，factor 小于 1 或为 NaN 会在构造时被拒绝；Query 入缓存后必须保持 hash 与等价关系稳定，修改 key 可能在淘汰时触发 `ConcurrentModificationException`。查询、策略或集合构建产生的 `IOException` 会向上传播。源码：`LRUQueryCache.java:126`、`LRUQueryCache.java:331`、`LRUQueryCache.java:707`。
 
-**源码事实**：两参数构造器注释称成本至多为顶层查询的 100 倍，而实际传入 `skipCacheFactor = 10`。注释还写文档数“more than 10k”，实际判断 `maxDoc < 10000` 才拒绝，因此正好 10000 也可能通过。
+## 8. 相关测试
 
-证据：`search/LRUQueryCache.java:139`、`search/LRUQueryCache.java:148`、`search/LRUQueryCache.java:162`。
+以下是已有测试的阅读入口，不表示本次运行了测试：
 
-**结论**：解释当前版本时应以实现为准。这是注释不一致，本文不据此认定缓存结果有正确性缺陷。
+| 想验证的问题 | 测试入口 |
+| --- | --- |
+| 最近访问顺序怎样改变，谁被淘汰 | `TestLRUQueryCache.java:237`，`testLRUEviction` |
+| 多个 Segment 会不会重复登记使用次数 | `TestLRUQueryCache.java:633`，`testOnUse` |
+| 评分查询里的过滤子句能否缓存 | `TestLRUQueryCache.java:1009`，`testBooleanQueryCachesSubClauses` |
+| 成本门槛会不会跳过缓存 | `TestLRUQueryCache.java:1923`，`testSkipCachingForRangeQuery` |
+| 有删除后为什么不能直接返回缓存数量 | `TestLRUQueryCache.java:2057`，`testCacheHasFastCount` |
+| TermQuery 默认是否缓存 | `TestUsageTrackingFilterCachingPolicy.java:50`，`testNeverCacheTermFilter` |
 
-### 12.2 LRU 的更新与完整集合构建有易误读的边界
+## 9. 源码审阅发现
 
-**源码事实**：get 访问全局 Query 时可以更新 LRU，即便当前 Segment 最终 miss；bulkScorer 构建路径没有 supplier 的成本倍数判断；稀疏格式选择依赖估算 cost。
+**构造器注释与实际参数不一致。** 注释写成本倍数为 100，实际默认 factor 为 10；注释写文档数超过 10000，实际正好 10000 也可能通过。源码事实见 `LRUQueryCache.java:139`、`LRUQueryCache.java:148`、`LRUQueryCache.java:162`。解释行为时应使用实际判断，这些注释差异不等于查询结果存在错误。
 
-**推断**：仅根据“最近命中次数”“实际命中率”或 factor 参数推测全部缓存行为，容易与真实状态不符。
+锁外重复构建可能增加临时内存和计算开销，这是从实现推导出的性能影响；具体影响大小需要运行时测量，不能仅凭源码认定已经发生性能故障。
 
-**待验证项**：具体工作负载下重复构建的内存峰值、锁竞争占比、全量构建耗时需要运行时测量。本文没有运行性能基准，也不将这些设计取舍认定为已复现缺陷。
+## 10. 最后串起来读一次
 
-## 13. 心智模型与推荐阅读顺序
+**先由策略决定是否值得存，再按 Segment 存匹配集合，命中后直接遍历集合，容量不足时按 Query 淘汰所有相关集合。**
 
-把它理解成三个协作部件：**策略决定是否值得新建，core key 决定结果属于哪个 Segment，全局 Query LRU 决定容量不足时一起淘汰谁。** 查找成功后只是遍历集合；删除过滤与最终评分仍由各自的外层执行流程负责。
+重新打开源码时，建议沿本文主线阅读：
 
-建议按以下顺序读代码：
+```text
+IndexSearcher.createWeight        IndexSearcher.java:898
+  → 加入缓存包装                  LRUQueryCache.java:474
+  → 执行到具体 Segment            LRUQueryCache.java:891
+  → 查找已有集合                  LRUQueryCache.java:267
+  → miss 后判断是否值得缓存       UsageTrackingQueryCachingPolicy.java:177
+  → 完整生成集合                  LRUQueryCache.java:707、501
+  → 插入并检查淘汰                LRUQueryCache.java:292、321
+```
 
-1. `search/IndexSearcher.java:898` → `search/BooleanWeight.java:52`：哪些 Weight 可以进入缓存。
-2. `search/LRUQueryCache.java:474` → `search/LRUQueryCache.java:724`：包装、资格检查、命中与 miss。
-3. `search/UsageTrackingQueryCachingPolicy.java:124`：是否值得为 miss 建缓存。
-4. `search/LRUQueryCache.java:501` → `search/LRUQueryCache.java:292`：集合构建和状态插入。
-5. `search/LRUQueryCache.java:321` → `search/LRUQueryCache.java:349`：LRU 淘汰与 core 关闭清理。
-6. `search/LRUQueryCache.java:832` → `search/LRUQueryCache.java:891`：补齐 count 与 bulkScorer 两条入口。
-7. 对照测试表，检查自己对使用频次、Query 数、集合条目数和删除语义的理解。
+读通这条线后，再补 `scorerSupplier` 的延迟构建与成本判断，以及 `count` 的快速计数路径，就能把三个执行入口对应起来。

@@ -65,6 +65,8 @@
 
 ## Elasticsearch
 
+- [副本分片提升为主分片：从故障路由到历史收敛](ElasticSearch/replica-promotion.md)
+
 - [`LRUQueryCache` 实现跟踪](ElasticSearch/lru-query-cache.md)
 - [Master 选举源码跟踪](<ElasticSearch/Master 选举源码跟踪.md>)
 - [`ReplicationTracker` 源码跟踪：从副本加入到 global checkpoint 推进](<ElasticSearch/ReplicationTracker 源码跟踪：从副本加入到 global checkpoint 推进.md>)

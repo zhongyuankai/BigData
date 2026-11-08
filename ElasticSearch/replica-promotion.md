@@ -73,6 +73,24 @@ sequenceDiagram
 
 定位：`server/src/main/java/org/elasticsearch/cluster/routing/RoutingNodes.java:375`、`server/src/main/java/org/elasticsearch/cluster/routing/ShardRouting.java:930`。
 
+下面摘录候选方法的返回表达式（`RoutingNodes.java:381`）。沿过滤条件向下读，最后的比较器明确落在 `DiscoveryNode.getVersion` 上：
+
+```java
+return assignedShards(shardId).stream()
+    .filter(shr -> shr.primary() == false && shr.active())
+    .filter(shr -> node(shr.currentNodeId()) != null)
+    .filter(ShardRouting::isPromotableToPrimary)
+    .max(
+        Comparator.comparing(
+            shr -> node(shr.currentNodeId()).node(),
+            Comparator.nullsFirst(Comparator.comparing(DiscoveryNode::getVersion))
+        )
+    )
+    .orElse(null);
+```
+
+对贯穿案例而言，B、C 都通过前三道过滤，且节点版本相同；仅凭这里的代码不能断言 B 比 C 的数据更新。B 被选中后，数据正确性仍要由后面的任期隔离和历史收敛保证。
+
 候选方法本身也没有逐个查询 in-sync 集合。不能据此推导“任意磁盘副本都能提升”：这里选的是当前路由中的活动、可提升副本，in-sync 集合由分片启动、失败及 stale 移除等流程另行维护。离线存储恢复不是这条即时提升路径。
 
 如果没有合格副本，旧主转为 unassigned primary，不能凭空产生一个活动主分片。该分支还会将残余不可提升副本转为 unassigned，原因记作 `UNPROMOTABLE_REPLICA`，后续交给分配和恢复流程。
@@ -85,9 +103,41 @@ sequenceDiagram
 
 定位：`RoutingNodes.java:695`、`RoutingNodes.java:747`、`ShardRouting.java:628`。
 
+有候选时，路由层真正执行的是下面两步（`RoutingNodes.java:696`）：
+
+```java
+movePrimaryToUnassignedAndDemoteToReplica(failedPrimary, unassignedInfo);
+promoteReplicaToPrimary(replicaToPromote, routingChangesObserver);
+```
+
+第一步腾出旧主的角色，第二步把 B 的活动副本路由替换为主分片路由。下面的图只表示 master 生成的路由状态；B 本地的执行切换还没有画入其中。
+
+```mermaid
+flowchart LR
+    A0["A：primary / STARTED"] -->|"A 故障，有候选 B"| A1["旧主槽位：replica / UNASSIGNED"]
+    B0["B：replica / STARTED"] -->|"提升，allocation id 不变"| B1["B：primary / STARTED"]
+    C0["C：replica / STARTED"] -->|"角色保持"| C1["C：replica / STARTED"]
+```
+
+图中没有给 B 增加 `INITIALIZING` 阶段：它已经是活动副本，接下来要做的是切换执行任期与修整历史。
+
 primary term 的增加不能简单归因于 `replicaPromoted` 回调：活动主分片失败时，`IndexMetadataUpdater.shardFailed` 调用 `increasePrimaryTerm`；应用元数据更新时才执行 `withIncrementedPrimaryTerm`。更新标志是布尔值，因此同一轮更新内多次通知不会逐次累加任期。
 
 定位：`server/src/main/java/org/elasticsearch/cluster/routing/allocation/IndexMetadataUpdater.java:83`、`:123`、`:322`。
+
+把“登记任期变化”与“写入元数据”放在一起看更清楚。以下分别摘自 `IndexMetadataUpdater.java:91`、`:123`，中间流程省略：
+
+```java
+increasePrimaryTerm(failedShard.shardId());
+```
+
+```java
+updatedIndexMetadata = updates.increaseTerm
+    ? updatedIndexMetadata.withIncrementedPrimaryTerm(shardId.id())
+    : updatedIndexMetadata;
+```
+
+因此，案例中的 `7 → 8` 与活动主分片失败相关；不能把增加任期理解为任意一次路由角色修改都会触发。
 
 | 对象 | 故障前 | master 生成的新状态 |
 | --- | --- | --- |
@@ -115,6 +165,52 @@ in-sync 集合另行合并 added/removed allocation id；故障并不一概等�
 
 定位：`IndexShard.java:617`、`:622`、`:692`、`:3729`。
 
+下面是 `bumpPrimaryTerm` 成功回调中的关键顺序（`IndexShard.java:3763`）：
+
+```java
+termUpdated.await();
+// indexShardOperationPermits doesn't guarantee that async submissions are executed
+// in the order submitted. We need to guard against another term bump
+if (getOperationPrimaryTerm() < newPrimaryTerm) {
+    replicationTracker.setOperationPrimaryTerm(newPrimaryTerm);
+    onBlocked.run();
+}
+```
+
+方法尾部则先记录准备进入的任期，再解除回调的等待（`IndexShard.java:3785`）：
+
+```java
+pendingPrimaryTerm = newPrimaryTerm;
+termUpdated.countDown();
+```
+
+`onBlocked.run()` 对应提升时传入的动作；它的第一步还有 `shardStateUpdated.await()`。两个 latch 分别保证“新任期已经记录”和“本地新路由已经设置”。图中箭头表示必须先满足的条件，线程的具体调度顺序不固定：
+
+```mermaid
+flowchart TD
+    S["收到 primary 路由，term=8"] --> G["asyncBlockOperations：延迟新操作，等待旧许可释放"]
+    G --> P["pendingPrimaryTerm=8；termUpdated.countDown"]
+    G --> W["异步回调取得独占条件"]
+    P --> T["termUpdated.await 返回"]
+    W --> T
+    T --> O["operationPrimaryTerm=8"]
+    P --> R["外层设置 shardRouting；shardStateUpdated.countDown"]
+    O --> L["提升动作等待 shardStateUpdated"]
+    R --> L
+    L --> H["激活 primary mode、恢复历史、补洞、启动 resync"]
+    H --> U["回调退出，释放独占许可"]
+    H -.-> N["resync 网络同步异步完成"]
+```
+
+| 观察时点 | `pendingPrimaryTerm` | `operationPrimaryTerm` | 操作条件 |
+| --- | --- | --- | --- |
+| 切换前 | 7 | 7 | 按旧副本语义执行 |
+| 新任期已登记、回调尚未更新执行任期 | 8 | 7 | 新操作延迟，旧许可排空 |
+| 执行提升动作 | 8 | 8 | 独占条件下整理状态 |
+| 提升回调退出 | 8 | 8 | 许可恢复，resync 可能仍在进行 |
+
+中间两行可能非常短暂；它们解释的是源码允许的过渡状态，并不是每次都能从外部稳定观测到的运行阶段。
+
 这解释了为什么仅观察 routing 的 primary 标志不足以判断本地切换已经完成：中间仍可能处于操作许可阻塞阶段。
 
 ### 6.2 激活 primary mode，并修整本地历史
@@ -130,6 +226,34 @@ in-sync 集合另行合并 added/removed allocation id；故障并不一概等�
 
 定位：`IndexShard.java:635`、`server/src/main/java/org/elasticsearch/index/seqno/ReplicationTracker.java:1148`。
 
+历史处理的核心代码如下（`IndexShard.java:646`，省略中间解释性注释）：
+
+```java
+final Engine engine = getEngine();
+engine.restoreLocalHistoryFromTranslog(
+    (resettingEngine, snapshot) -> runTranslogRecovery(
+        resettingEngine,
+        snapshot,
+        Engine.Operation.Origin.LOCAL_RESET,
+        () -> {}
+    )
+);
+// ... 省略关于 translog generation 的解释性注释
+engine.rollTranslogGeneration();
+engine.fillSeqNoGaps(newPrimaryTerm);
+replicationTracker.updateLocalCheckpoint(currentRouting.allocationId().getId(), getLocalCheckpoint());
+```
+
+对 B 来说，可以把变化按序列号画成一行：
+
+| 阶段 | 101 | 102 | 103 | 104 | 105 | local checkpoint |
+| --- | --- | --- | --- | --- | --- | --- |
+| 提升前 | 已处理 | 已处理 | 已处理 | 空洞 | 已处理 | 103 |
+| 恢复历史后仍存在该空洞时 | 已处理 | 已处理 | 已处理 | 空洞 | 已处理 | 103 |
+| `fillSeqNoGaps(8)` 后 | 已处理 | 已处理 | 已处理 | term=8 的 no-op | 已处理 | 可推进至 105 |
+
+这里假设 translog 恢复没有找回 104；如果恢复步骤已经补回该序号，就无需再为它填 no-op。
+
 本例 B 的空洞 104 被补齐；假设没有并发新增操作、105 已处理完成，则 local checkpoint 可以推进到 105。填 no-op 不会凭空恢复缺失的业务写入内容。恢复 translog 那一步则专门覆盖连续两次故障提升的风险：前一次当副本时回滚的操作，不能在本次成为主分片时直接遗忘。
 
 ## 7. resync：让其他副本接受新主历史
@@ -142,6 +266,28 @@ in-sync 集合另行合并 added/removed allocation id；故障并不一概等�
 
 定位：`server/src/main/java/org/elasticsearch/index/shard/PrimaryReplicaSyncer.java:73`、`:132`、`:344`。
 
+同步起点和快照来自同一次 `resync` 调用。以下摘自 `PrimaryReplicaSyncer.java:76`、`:83`，省略断言和局部变量：
+
+```java
+final long startingSeqNo = indexShard.getLastKnownGlobalCheckpoint() + 1;
+final long maxSeqNo = indexShard.seqNoStats().getMaxSeqNo();
+// ...
+snapshot = indexShard.newChangesSnapshot("resync", startingSeqNo, Long.MAX_VALUE, false, false, true);
+```
+
+发送侧决定首批裁剪边界的代码（`PrimaryReplicaSyncer.java:344`）：
+
+```java
+final long trimmedAboveSeqNo = firstMessage.get() ? maxSeqNo : SequenceNumbers.UNASSIGNED_SEQ_NO;
+// have to send sync request even in case of there are no operations to sync - have to sync trimmedAboveSeqNo at least
+if (operations.isEmpty() == false || trimmedAboveSeqNo != SequenceNumbers.UNASSIGNED_SEQ_NO) {
+    task.setPhase("sending_ops");
+    // ... 构造请求并发送
+}
+```
+
+如果调用时 B 的 global checkpoint 仍为 100、max seq_no 为 105，那么发送范围从 101 开始，首批同时携带裁剪上界 105。后续即使新任期写入产生了 106，也不能把这个上界解释为“删除所有大于 105 的操作”：裁剪方法针对的是旧任期历史。
+
 ### 7.2 C 先进入新任期，再执行同步操作
 
 副本操作许可逻辑收到较大 primary term 时，同样阻塞操作并切换任期。若当前 global checkpoint 小于 max seq_no，会执行 `resetEngineToGlobalCheckpoint`；否则滚动 translog generation。这样先整理可能分歧的未安全尾部，再接受新主复制的历史。
@@ -149,6 +295,18 @@ in-sync 集合另行合并 added/removed allocation id；故障并不一概等�
 旧于当前 operation term 的请求会被拒绝；这属于任期隔离的一部分，不能扩写为“旧主一失联就立即在本地停止所有执行”。
 
 定位：`IndexShard.java:3870`、`:3902`。
+
+收到新任期的副本，在阻塞回调中根据安全进度选择如何处理尾部历史（`IndexShard.java:3912`）：
+
+```java
+if (currentGlobalCheckpoint < maxSeqNo) {
+    resetEngineToGlobalCheckpoint();
+} else {
+    getEngine().rollTranslogGeneration();
+}
+```
+
+这与 B 的提升动作形成配合：B 恢复自己的本地历史并确立新主历史，C 在接收新任期操作时整理可能分歧的尾部，再接收 B 的同步内容。两边不能只做一次角色标志翻转。
 
 `TransportResyncReplicationAction.performOnReplica` 更新 auto-id timestamp，以 `REPLICA` origin 应用操作；需要 mapping 时抛出可重试异常。若携带裁剪上界，则调用 `trimOperationOfPreviousPrimaryTerms`，针对旧任期历史裁剪，不是无条件删除所有超出上界的新任期操作。
 

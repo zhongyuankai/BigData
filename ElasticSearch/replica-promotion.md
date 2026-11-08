@@ -1,10 +1,12 @@
-# 副本分片提升为主分片：从故障路由到历史收敛
+# 主分片从故障到恢复：副本提升、历史收敛与复制组重建
 
-## 1. 提升解决什么问题
+## 1. 从恢复主服务到恢复副本冗余
 
 一个 replication group 的主分片故障后，master 需要选出可接替的副本；被选节点则必须停止沿用旧主的执行语义，进入新的 primary term，整理本地历史并同步其他副本。这是两个相互衔接的阶段：**路由中的 `primary=true` 是角色决定，数据节点取得 primary mode 并完成任期切换才建立本地执行条件。**
 
-主线入口如下。这里讨论普通可提升副本的故障切换，主分片 relocation 仅作边界对照。
+本文跟踪普通主副本复制组从故障检测到重新具备主副本的完整主线，并展开没有活动副本时的本地存储恢复分支。主分片 relocation、快照恢复和 DCDR 远端恢复作为边界说明。
+
+“恢复”有两个完成点：新主完成本地接管后可以处理新任期操作；缺失副本补齐并启动后才恢复预期冗余。下面先看新主接管，随后继续跟踪副本重建。
 
 ```mermaid
 sequenceDiagram
@@ -12,6 +14,7 @@ sequenceDiagram
     participant R as RoutingNodes
     participant B as 被提升副本 B
     participant C as 其他副本 C
+    participant D as 恢复目标 D
     M->>R: failShard(旧主 A)
     R->>R: 清理 initializing 副本，选择 active 可提升副本
     R-->>M: B 变为 primary，A 变为 unassigned replica
@@ -19,10 +22,21 @@ sequenceDiagram
     M->>B: 发布并应用 cluster state
     B->>B: 阻塞操作、切换 term、激活 primary mode
     B->>B: 恢复本地历史、补齐 seq_no 空洞
-    B->>C: resync（异步分批发送）
+    par 收敛已有副本历史
+        B->>C: resync（异步分批发送）
     C->>C: 切换 term、处理历史、应用操作
     C-->>B: 返回同步结果
+    and 重建缺失副本
+        M->>M: 为缺失副本选择恢复目标 D
+    M->>D: 发布 INITIALIZING 副本路由
+    D->>B: 请求 peer recovery
+    B->>D: 恢复文件或历史操作
+    D->>M: shardStarted
+    M->>D: 发布 STARTED 路由
+    end
 ```
+
+图中两条收敛路径可以交叠执行：缺失副本的分配恢复不以所有 `resync` 消息结束为统一起点。
 
 对应代码：`server/src/main/java/org/elasticsearch/cluster/routing/RoutingNodes.java:551`、`server/src/main/java/org/elasticsearch/indices/cluster/IndicesClusterStateService.java:746`、`server/src/main/java/org/elasticsearch/index/shard/IndexShard.java:501`。
 
@@ -40,7 +54,54 @@ sequenceDiagram
 
 ## 3. 故障怎样进入 master 分配逻辑
 
-### 3.1 节点离开与单个 shard 失败是两个入口
+### 3.1 从检测故障到提交 master 任务
+
+**节点故障**：master 的 `FollowersChecker` 对 follower 检查失败后，经 `failNode` 在协调线程执行故障回调。`Coordinator` 将此回调绑定到 `removeNode`；只有当前模式为 `LEADER` 才提交 `NodeLeftExecutor.Task`。检查失败、连接断开与节点落后等不同检测原因可以进入节点移除链路，不能把某一次请求超时直接等同于主分片已经完成切换。
+
+源码：`server/src/main/java/org/elasticsearch/cluster/coordination/Coordinator.java:361`（节选）。
+
+```java
+private void removeNode(DiscoveryNode discoveryNode, String reason) {
+    synchronized (mutex) {
+        if (mode == Mode.LEADER) {
+            var task = new NodeLeftExecutor.Task(discoveryNode, reason, () -> joinReasonService.onNodeRemoved(discoveryNode, reason));
+            nodeLeftQueue.submitTask("node-left", task, null);
+        }
+    }
+}
+```
+
+关键是 `mode == Mode.LEADER`：master 负责修改全局路由，持有副本的节点不会自行通过本地超时宣布自己成为新主。故障检查回调定位于 `FollowersChecker.java:425`，绑定定位于 `Coordinator.java:286`。
+
+**分片故障**：`IndexShard` 的失败回调由 `IndicesClusterStateService.FailedShardHandler` 消费，异步进入 `failAndRemoveShard`，移除本地失败实例并上报。`sendFailShard` 先写入失败缓存，再调用 `ShardStateAction.localShardFailed`，避免后续状态应用立即反复创建同一个已失败路由。
+
+源码：`server/src/main/java/org/elasticsearch/indices/cluster/IndicesClusterStateService.java:917`（节选）。
+
+```java
+failedShardsCache.put(shardRouting.shardId(), shardRouting);
+shardStateAction.localShardFailed(shardRouting, message, failure, ActionListener.noop(), state);
+```
+
+本地失败上报携带 shard id 和 allocation id，primary term 字段为 `0L`，表示分片报告自身失败；主端因复制失败上报其他副本时，则携带自己的任期。见 `ShardStateAction.java:224`、`:177`。
+
+### 3.2 master 为什么还要校验失败消息
+
+失败消息可能在网络中滞留。`ShardFailedClusterStateTaskExecutor.execute` 对带非零任期的复制失败报告，比较请求任期和当前索引任期；不匹配则以 `NoLongerPrimaryShardException` 结束该任务，避免旧主的延迟失败报告误伤新复制组。
+
+源码：`server/src/main/java/org/elasticsearch/cluster/action/shard/ShardStateAction.java:333`（节选）。
+
+```java
+if (entry.primaryTerm > 0) {
+    long currentPrimaryTerm = indexMetadata.primaryTerm(entry.getShardId().id());
+    if (currentPrimaryTerm != entry.primaryTerm) {
+        // ... 以 NoLongerPrimaryShardException 结束该任务，然后 continue
+    }
+}
+```
+
+这里仅摘录判断入口；分支内构造异常并 `continue`。随后按 allocation id 查找 routing：有匹配路由则加入失败列表；没有路由、但属于当前任期上报且 id 还在 in-sync 集合时，仅标记 stale；其他已过期消息可按成功忽略。定位：`ShardStateAction.java:368`。这些检查发生在真正进入 `AllocationService.applyFailedShards` 之前。
+
+### 3.3 节点离开与单个 shard 失败是两个入口
 
 节点离开由 `NodeLeftExecutor` 移除节点后调用 `AllocationService.disassociateDeadNodes`。后者遍历已经不在存活数据节点集合中的 routing node，为其 shard 构造 `NODE_LEFT` 或 `NODE_RESTARTING` 信息，再逐个调用 `RoutingNodes.failShard`。
 
@@ -50,15 +111,41 @@ sequenceDiagram
 
 定位：`server/src/main/java/org/elasticsearch/cluster/action/shard/ShardStateAction.java:397`、`server/src/main/java/org/elasticsearch/cluster/routing/allocation/AllocationService.java:191`。
 
+源码：`cluster/routing/allocation/AllocationService.java:243`（节选）。
+
+```java
+if (failedShardEntry.markAsStale()) {
+    allocation.removeAllocationId(failedShard);
+}
+logger.warn(() -> "failing shard [" + failedShardEntry + "]", failedShardEntry.failure());
+allocation.routingNodes().failShard(logger, failedShard, unassignedInfo, allocation.changes());
+```
+
+这里把 stale 处理和路由失败放在同一轮分配变更中。节点离开分支也汇入 `RoutingNodes.failShard`，并在需要时继续 reroute，见 `AllocationService.java:276`。
+
 节点离开流程虽然会记录 delayed 标记，但 `failShard` 内部直接尝试提升活动副本。不能把延迟重新分配等同于“必须等超时才选新主”。
 
-### 3.2 为什么先清理 initializing 副本
+### 3.4 为什么先清理 initializing 副本
 
 `failShard` 发现失败对象为 primary 后，先对同组 `initializing` 副本递归执行失败处理。这些副本仍处于恢复中，不能直接接替旧主；代码注释还明确指出，该顺序用于避免让 `RoutingNodes` 进入不一致状态。
 
 若副本正在 relocation，初始化中的目标也会被处理，源端取消 relocation 并回到可提升的 `STARTED` 状态。因此 `promoteReplicaToPrimary` 会断言候选已经是 `started()`。
 
 定位：`RoutingNodes.java:575`、`RoutingNodes.java:701`。
+
+源码：`cluster/routing/RoutingNodes.java:580`（节选）。
+
+```java
+if (routing.primary() == false && routing.initializing()) {
+    // re-resolve replica as earlier iteration could have changed source/target of replica relocation
+    ShardRouting replicaShard = getByAllocationId(routing.shardId(), routing.allocationId().getId());
+    assert replicaShard != null : "failed to re-resolve " + routing + " when failing replicas";
+    // ... 构造 primaryFailedUnassignedInfo
+    failShard(logger, replicaShard, primaryFailedUnassignedInfo, routingChangesObserver);
+}
+```
+
+该分支接下来构造原因是 `PRIMARY_FAILED` 的 `UnassignedInfo`，递归调用 `failShard`；省略的是原因对象的参数构造，而不是另一次候选选择。
 
 ## 4. 候选选择：不是比较谁的 seq_no 最大
 
@@ -149,6 +236,33 @@ in-sync 集合另行合并 added/removed allocation id；故障并不一概等�
 
 定位：`IndexMetadataUpdater.java:185`、`:223`。
 
+### 5.1 路由和任期如何一起进入新 cluster state
+
+`AllocationService` 根据变更后的 `RoutingNodes` 生成 `RoutingTable`，再将 routing observer 收集的变化应用到 metadata，最后把两者写入同一个新状态。这样发布的是彼此匹配的路由与任期，而不是先广播新主角色、再单独广播任期。
+
+源码：`server/src/main/java/org/elasticsearch/cluster/routing/allocation/AllocationService.java:159`（节选）。
+
+```java
+final RoutingTable newRoutingTable = RoutingTable.of(oldRoutingTable.version(), newRoutingNodes);
+final Metadata newMetadata = allocation.updateMetadataWithRoutingChanges(newRoutingTable);
+assert newRoutingTable.validate(newMetadata); // validates the routing table is coherent with the cluster state metadata
+
+final ClusterState.Builder newStateBuilder = ClusterState.builder(oldState).routingTable(newRoutingTable).metadata(newMetadata);
+```
+
+分配任务返回新状态后，由 `MasterService` 进入发布。其 `publish` 方法调用已配置的 `clusterStatePublisher.publish`；发布与应用存在异步过程，因此各数据节点不会在路由对象生成的一瞬间同时切换角色。
+
+源码：`server/src/main/java/org/elasticsearch/cluster/service/MasterService.java:475`（节选）。
+
+```java
+clusterStatePublisher.publish(
+    clusterStatePublicationEvent,
+    // ... 发布完成回调、ackListener
+);
+```
+
+上面省略发布完成与确认回调参数，发布调用入口见 `MasterService.java:353`。以下继续看新状态到达数据节点后的应用。
+
 ## 6. B 收到 cluster state：角色和执行状态如何衔接
 
 `IndicesClusterStateService.updateShard` 从新状态读取 primary term、in-sync ids 和 shard routing table，调用 `IndexShard.updateShardState`，并传入 `primaryReplicaSyncer::resync`。
@@ -156,6 +270,21 @@ in-sync 集合另行合并 added/removed allocation id；故障并不一概等�
 `updateShardState` 校验 shard id 和 allocation id，禁止同一个本地 primary 直接降为 replica；对于新 primary，先将 master 的复制组信息传给 `ReplicationTracker.updateFromMaster`。本例的 term 从 7 增加到 8，进入提升分支。
 
 定位：`IndicesClusterStateService.java:746`、`IndexShard.java:501`、`:580`。
+
+源码：`indices/cluster/IndicesClusterStateService.java:762`（节选）。
+
+```java
+shard.updateShardState(
+    shardRouting,
+    primaryTerm,
+    primaryReplicaSyncer::resync,
+    clusterState.version(),
+    inSyncIds,
+    indexShardRoutingTable
+);
+```
+
+`primaryReplicaSyncer::resync` 在这里被作为回调传入；是否调用它由 `IndexShard` 的任期切换分支决定。
 
 ### 6.1 先挡住操作，再切换执行任期
 
@@ -320,7 +449,259 @@ if (currentGlobalCheckpoint < maxSeqNo) {
 
 定位：`IndexShard.java:665`、`:882`、`:3729`、`PrimaryReplicaSyncer.java:109`。
 
-## 8. 主要边界
+## 8. 新主接管之后：补齐缺失副本
+
+A 故障、B 提升后，复制组仍缺一个副本。接下来假设 master 将这个槽位分配到 D；D 可以是新节点，也可以是重新加入的旧节点 A。恢复始终以新主 B 的权威历史为准，旧节点磁盘数据只决定能否复用文件和操作，不会使其自动恢复原主身份。
+
+```mermaid
+sequenceDiagram
+    participant M as master
+    participant D as 恢复目标 D
+    participant B as 新主 B
+    M->>M: 分配缺失副本：UNASSIGNED → INITIALIZING
+    M->>D: 应用包含恢复任务的 cluster state
+    D->>B: StartRecoveryRequest（目标存储信息、startingSeqNo）
+    B->>B: 判断操作恢复或文件恢复
+    opt 需要文件恢复
+        B->>D: phase1：复用或传输 safe commit 文件
+    end
+    B->>D: 准备 translog 恢复，打开目标 engine
+    B->>B: initiateTracking，再采样 endingSeqNo
+    B->>D: phase2：发送历史操作
+    B->>B: markAllocationIdAsInSync
+    B->>D: finalizeRecovery（global checkpoint、裁剪边界）
+    D->>D: postRecovery
+    D->>M: shardStarted
+    M->>M: 校验 allocation id，INITIALIZING → STARTED
+    M->>D: 发布 STARTED 路由
+    D->>D: 本地 POST_RECOVERY → STARTED
+```
+
+### 8.1 master 分配副本：先决定目标，再恢复数据
+
+`AllocationService.reroute` 先尝试已有分片分配，再执行 shard allocator。使用 desired balance 时，`DesiredBalanceReconciler` 对目标节点执行 `canAllocate`；决策为 `YES` 才真正初始化该副本。空间不足、分配过滤、同一 shard 已在节点上或恢复限流，都可能让这个阶段继续等待。定位：`AllocationService.java:529`、`DesiredBalanceReconciler.java:310`。
+
+源码：`server/src/main/java/org/elasticsearch/cluster/routing/allocation/allocator/DesiredBalanceReconciler.java:323`（节选）。
+
+```java
+routingNodes.initializeShard(shard, nodeId, null, shardSize, allocation.changes());
+```
+
+使用 balanced allocator 时也汇入 `RoutingNodes.initializeShard`，见 `BalancedShardsAllocator.java:1145`。本章不展开平衡算法全部策略；恢复链路的关键结果是目标 D 获得 `INITIALIZING` 副本路由，而不是已经成为活动副本。
+
+### 8.2 D 如何找到 B，并启动 peer recovery
+
+D 应用新状态时，`IndicesClusterStateService.createShard` 为 `PEER` 恢复选择源节点。普通副本的源是当前活动主分片 B；若主分片未活动或源节点不可见，则暂不创建。定位：`IndicesClusterStateService.java:567`、`:809`。
+
+`IndicesService.createShard` 创建实例并调用 `IndexShard.startRecovery`。不同 recovery source 在此分流：
+
+源码：`server/src/main/java/org/elasticsearch/index/shard/IndexShard.java:3392`（节选）。
+
+```java
+switch (recoveryState.getRecoverySource().getType()) {
+    case EMPTY_STORE, EXISTING_STORE -> executeRecovery("from store", recoveryState, recoveryListener, this::recoverFromStore);
+    case PEER -> {
+        try {
+            markAsRecovering("from " + recoveryState.getSourceNode(), recoveryState);
+            recoveryTargetService.startRecovery(this, recoveryState.getSourceNode(), clusterStateVersion, recoveryListener);
+```
+
+这里只摘录本地存储和 peer 两条分支的入口，省略后续异常处理及闭合括号。目标端 `PeerRecoveryTargetService.doRecovery` 准备存储元数据、恢复起点等信息，发送恢复请求；源端进入 `RecoverySourceHandler.recoverToTarget`。调用定位：`IndicesService.java:881`、`PeerRecoveryTargetService.java:275`、`:363`。
+
+### 8.3 选择按操作恢复，还是先恢复文件
+
+“旧主重新加入”并不意味着一定要重传全部文件。源端根据目标提供的恢复起点、history 是否相同、主端历史是否完整，以及 retention lease 是否覆盖起点来选择路径：
+
+源码：`server/src/main/java/org/elasticsearch/indices/recovery/RecoverySourceHandler.java:214`（节选）。
+
+```java
+final boolean isSequenceNumberBasedRecovery = request.startingSeqNo() != SequenceNumbers.UNASSIGNED_SEQ_NO
+    && isTargetSameHistory()
+    && shard.hasCompleteHistoryOperations("peer-recovery", request.startingSeqNo())
+    && ((retentionLease == null && shard.useRetentionLeasesInPeerRecovery() == false)
+        || (retentionLease != null && retentionLease.retainingSequenceNumber() <= request.startingSeqNo()));
+```
+
+满足条件时按序列号恢复，跳过文件阶段；否则获取 safe commit 进入 `phase1`，比较文件元数据，复用可复用文件并传输所需文件，然后恢复 safe commit 之后的操作。不是每次文件恢复都无差别复制所有文件。定位：`RecoverySourceHandler.java:250`、`:303`、`:533`。
+
+源码：`indices/recovery/RecoverySourceHandler.java:303`（节选）。
+
+```java
+phase1(safeCommitRef.getIndexCommit(), startingSeqNo, () -> estimateNumOps, sendFileStep);
+```
+
+文件路径的 `startingSeqNo` 取 safe commit 的 local checkpoint 加一（`RecoverySourceHandler.java:283`）。文件提供一致的基础，后续历史重放负责补齐该基础之后的写入。
+
+### 8.4 恢复期间新写入怎样避免漏掉
+
+文件阶段结束后，源端先调用 `prepareTargetForTranslog`，待目标 engine 可接受操作，再将 D 加入复制跟踪。关键顺序是 **先 `initiateTracking`，再采样 `endingSeqNo`**：
+
+源码：`server/src/main/java/org/elasticsearch/indices/recovery/RecoverySourceHandler.java:328`（节选）。
+
+```java
+runUnderPrimaryPermit(
+    () -> shard.initiateTracking(request.targetAllocationId()),
+    shard,
+    cancellableThreads,
+    ActionListener.wrap(ignored -> {
+        final long endingSeqNo = shard.seqNoStats().getMaxSeqNo();
+        // ... 创建历史快照并执行 phase2
+    }, onFailure)
+);
+```
+
+此处省略后面的快照构造和 `phase2` 调用。源码注释说明，进入跟踪后新的主端写入也会复制到 D；采样之前的历史由 phase2 覆盖，之后的写入由正常复制继续覆盖，从而衔接恢复流和实时写入。`initiateTracking` 还不等于“D 已同步完成”。定位：`RecoverySourceHandler.java:320`、`:352`。
+
+源码：`indices/recovery/RecoverySourceHandler.java:352`（节选）。
+
+```java
+phase2(
+    startingSeqNo,
+    endingSeqNo,
+    phase2Snapshot,
+    maxSeenAutoIdTimestamp,
+    maxSeqNoOfUpdatesOrDeletes,
+    retentionLeases,
+    mappingVersionOnPrimary,
+    sendSnapshotStep
+);
+```
+
+`phase2Snapshot` 从恢复起点创建，`endingSeqNo` 界定本次历史同步需要覆盖的尾部；租约、自动 id 时间戳和更新/删除序列号等随恢复传给目标。
+
+### 8.5 先进入主端同步集合，再完成恢复确认
+
+phase2 返回目标 checkpoint 后，`finalizeRecovery` 在 primary permit 下调用 `markAllocationIdAsInSync`，随后发送 finalize 请求：
+
+源码：`server/src/main/java/org/elasticsearch/indices/recovery/RecoverySourceHandler.java:1285`（节选）。
+
+```java
+final SubscribableListener<Void> markInSyncStep = new SubscribableListener<>();
+runUnderPrimaryPermit(
+    () -> cancellableThreads.execute(() -> shard.markAllocationIdAsInSync(request.targetAllocationId(), targetLocalCheckpoint)),
+    shard,
+    cancellableThreads,
+    markInSyncStep
+);
+
+final SubscribableListener<Long> finalizeListener = new SubscribableListener<>();
+markInSyncStep.addListener(listener.delegateFailureAndWrap((l, ignored) -> {
+    final long globalCheckpoint = shard.getLastKnownGlobalCheckpoint(); // this global checkpoint is persisted in finalizeRecovery
+    cancellableThreads.checkForCancel();
+    recoveryTarget.finalizeRecovery(globalCheckpoint, trimAboveSeqNo, finalizeListener.map(ignored2 -> globalCheckpoint));
+}));
+```
+
+主端 `ReplicationTracker` 内的 in-sync 状态和 master `IndexMetadata` 的 in-sync 集合是不同层次：前者在恢复 finalize 阶段更新，后者在 master 接受 shard started、应用 routing observer 变更时更新。不能把一次本地 `markAllocationIdAsInSync` 当成 master 已经发布 `STARTED`。
+
+源码：`index/seqno/ReplicationTracker.java:1331`（节选）。
+
+```java
+if (cps.localCheckpoint < getGlobalCheckpoint()) {
+    pendingInSync.add(allocationId);
+    // ... 等待进度推进并处理 pendingInSync 的清理
+} else {
+    cps.inSync = true;
+    updateReplicationGroupAndNotify();
+    // ... 更新 global checkpoint
+}
+```
+
+这里省略等待循环与清理细节。目标进度尚未达到 global checkpoint 时，先加入 `pendingInSync` 并等待追赶；进度满足后才能成为 in-sync。否则把落后的目标直接视为同步完成，会破坏安全进度的含义。
+
+目标恢复响应成功后，由 `RecoveriesCollection.markRecoveryAsDone` 移除恢复记录并调用 `RecoveryTarget.markAsDone`，后者执行 `postRecovery`，再通知 `RecoveryListener.onRecoveryDone` 上报：
+
+源码：`server/src/main/java/org/elasticsearch/indices/cluster/IndicesClusterStateService.java:860`（节选）。
+
+```java
+shardStateAction.shardStarted(
+    shardRouting,
+    primaryTerm,
+    "after " + state.getRecoverySource(),
+    timestampMillisFieldRange,
+    ActionListener.noop()
+);
+```
+
+定位：`PeerRecoveryTargetService.java:732`、`RecoveriesCollection.java:218`、`RecoveryTarget.java:320`。master 的 started executor 按 allocation id 匹配路由，忽略已过期或重复消息；对 primary 的 started 消息还核对任期。随后调用 `AllocationService.applyStartedShards`：
+
+源码：`server/src/main/java/org/elasticsearch/cluster/action/shard/ShardStateAction.java:689`（节选）。
+
+```java
+maybeUpdatedState = allocationService.applyStartedShards(initialState, shardRoutingsToBeApplied);
+```
+
+分配层将目标路由转为 `STARTED`，`IndexMetadataUpdater.shardStarted` 记录其 allocation id，新的 cluster state 发布后，D 的 `IndexShard.updateShardState` 才把本地 `POST_RECOVERY` 转为 `STARTED`。定位：`AllocationService.java:603`、`IndexMetadataUpdater.java:65`、`IndexShard.java:535`。
+
+到这里，案例的最终状态是 B 为主、C 与 D 为副本，三者路由均为 `STARTED`。这表示本复制组恢复了预期冗余；集群是否整体 green 还取决于其他 shard。
+
+恢复异常通过 `RecoveryListener.onRecoveryFailure` → `handleRecoveryFailure` → `failAndRemoveShard` 清理目标，并根据 `sendShardFailure` 决定是否通知 master。后续是否重试及何时重试，仍受分配决策和失败重试限制影响，不能假设每次失败都会立即无限重试。定位：`IndicesClusterStateService.java:871`。
+
+## 9. 没有活动副本：从本地存储恢复主分片
+
+### 9.1 找不到候选时为什么不新建空主分片
+
+假设 A、B、C 都离线。`RoutingNodes` 没有活动候选，只保留未分配主分片；master 随后的 reroute 会尝试已有数据恢复。`PrimaryShardAllocator` 异步收集节点的 shard 存储信息；未拿到结果时返回 `FETCHING_SHARD_DATA`。
+
+已有数据的普通主分片根据 `inSyncAllocationIds` 筛选可用存储。关键过滤如下；`matchAnyShard` 用于其他恢复情形，不代表普通已有存储恢复可以随意绕过 in-sync：
+
+源码：`server/src/main/java/org/elasticsearch/gateway/PrimaryShardAllocator.java:351`（节选）。
+
+```java
+if (matchAnyShard || inSyncAllocationIds.contains(nodeShardState.allocationId())) {
+    nodeShardStates.add(nodeShardState);
+}
+```
+
+若普通已有数据恢复没有候选，则返回 `NO_VALID_SHARD_COPY`；可以等拥有有效副本的节点重新加入，再触发 reroute。即使找到了有效存储，分配决策器仍可能拒绝或限流。定位：`PrimaryShardAllocator.java:88`、`:101`、`:125`。
+
+这就是“没有可提升副本”和“数据已彻底丢失”的区别：前者只是没有在线活动副本，后续仍可能从有效存储恢复；如果所有有效副本都不可用，正常自动恢复链路会停在未分配状态。强制 stale/empty primary 属于显式人工恢复操作，本章不把它当成正常无损恢复路径。
+
+### 9.2 有效存储被分配后，怎样成为可用主分片
+
+分配结果将 primary 路由设为 `INITIALIZING`，数据节点创建 shard，经 `IndexShard.startRecovery` 的 `EXISTING_STORE` 分支进入 `StoreRecovery.internalRecoverFromStore`。它准备恢复状态、检查 store 损坏标志并读取最近提交；预期存在存储却读不到时会失败，而不是静默创建空索引。定位：`StoreRecovery.java:411`、`:429`。
+
+读取提交及恢复准备之后，核心收尾是：
+
+源码：`server/src/main/java/org/elasticsearch/index/shard/StoreRecovery.java:485`（节选）。
+
+```java
+indexShard.openEngineAndRecoverFromTranslog();
+indexShard.getEngine().fillSeqNoGaps(indexShard.getPendingPrimaryTerm());
+indexShard.finalizeRecovery();
+indexShard.postRecovery("post recovery from shard_store", l);
+```
+
+本地存储恢复先打开 engine 并重放 translog、补齐序列号空洞，再 finalize 和 postRecovery；成功后走相同的 `shardStarted` 上报闭环。master 接受启动并发布活动 primary 路由后，数据节点才激活 primary mode：
+
+源码：`server/src/main/java/org/elasticsearch/index/shard/IndexShard.java:579`（节选）。
+
+```java
+if (currentRouting.initializing() && currentRouting.isRelocationTarget() == false && newRouting.active()) {
+    // the master started a recovering primary, activate primary mode.
+    replicationTracker.activatePrimaryMode(getLocalCheckpoint());
+    ensurePeerRecoveryRetentionLeasesExist();
+}
+```
+
+这个分支与活动副本提升不同：本地实例本来就是正在恢复的 primary，完成启动后激活 primary mode，不再重复执行“副本提升的新任期 + resync”分支。缺失副本随后按第 8 节继续补齐。
+
+```mermaid
+flowchart TD
+    F["主分片故障"] --> Q{"存在活动且可提升的副本？"}
+    Q -->|"有"| P["原地提升副本，进入新任期并 resync"]
+    Q -->|"无"| U["保留 UNASSIGNED primary"]
+    U --> S{"找到有效本地存储，且允许分配？"}
+    S -->|"等待数据或决策限制"| W["保持未分配，等待后续 reroute"]
+    W -.-> S
+    S -->|"允许"| I["INITIALIZING primary：打开 engine、重放 translog"]
+    I --> A["shardStarted，发布活动 primary，激活 primary mode"]
+    P --> R["分配并恢复缺失副本"]
+    A --> R
+    R --> D["副本启动确认，复制组冗余恢复"]
+```
+
+## 10. 主要边界
 
 - **只有 initializing 副本**：先失败恢复中的副本，没有活动候选就保留 unassigned primary，等待恢复。
 - **副本正在 relocation**：目标初始化被清理后，源副本可取消 relocation 再参与提升；不能把未恢复完成的目标当成现成新主。
@@ -328,7 +709,7 @@ if (currentGlobalCheckpoint < maxSeqNo) {
 - **旧主重新加入**：master 路由中的旧主槽位降级，不等于允许存活的同一个 `IndexShard` 原地降级；`updateShardState` 对该操作有显式拒绝。重新加入需依照新路由及恢复生命周期处理。
 - **DCDR**：当前 `IndexShard` 有 `isRemoteRecovery()` 相关状态检查豁免。本章案例限定普通副本；这些豁免不能推出 DCDR 远端恢复与普通 peer recovery 的完整行为一致。见 `IndexShard.java:551`、`:699`。
 
-## 9. 对照测试与验证边界
+## 11. 对照测试与验证边界
 
 以下是源码中的测试阅读入口，本次未执行 Gradle 测试：
 
@@ -344,8 +725,12 @@ if (currentGlobalCheckpoint < maxSeqNo) {
 
 定位：`server/src/test/java/org/elasticsearch/cluster/routing/allocation/FailedShardsRoutingTests.java:165`；`server/src/test/java/org/elasticsearch/index/shard/IndexShardTests.java:440`、`:552`、`:592`、`:627`、`:1273`、`:1330`。
 
-## 10. 心智模型与推荐阅读顺序
+补充恢复链路的测试阅读入口：`PrimaryShardAllocatorTests.testNoAsyncFetchData`（等待存储信息）、`testNoAllocationFound`、`testNoMatchingAllocationIdFound`（无候选或 allocation id 不匹配），见 `server/src/test/java/org/elasticsearch/gateway/PrimaryShardAllocatorTests.java:96`、`:113`、`:131`；文件与历史发送见 `server/src/test/java/org/elasticsearch/indices/recovery/RecoverySourceHandlerTests.java:171` 的 `testSendFiles` 和 `:258` 的 `testSendSnapshotSendsOps`。这些是对照入口，不代表本次已运行验证。
 
-把提升看作 **master 确定接班人 → 发布新任期 → 数据节点隔离旧操作 → 整理本地历史 → 异步收敛副本历史**。路由、任期、primary mode 与历史同步分别解决不同问题，不能只用一个 `primary` 标志概括。
+## 12. 心智模型与推荐阅读顺序
+
+把完整恢复看作 **发现并上报故障 → master 确定接班人或等待有效存储 → 发布路由与任期 → 数据节点建立主端执行条件 → 收敛历史 → 补齐副本并确认启动**。路由、任期、primary mode 与历史同步分别解决不同问题，不能只用一个 `primary` 标志概括。
 
 推荐依次阅读 `NodeLeftExecutor` / `ShardStateAction` → `AllocationService` → `RoutingNodes.failShard` 与候选方法 → `IndexMetadataUpdater` → `IndicesClusterStateService.updateShard` → `IndexShard.updateShardState` / `bumpPrimaryTerm` → `ReplicationTracker.activatePrimaryMode` → `PrimaryReplicaSyncer` → `TransportResyncReplicationAction.performOnReplica`，最后用上述测试核对边界。
+
+完整恢复部分接着阅读 `DesiredBalanceReconciler` → `IndicesClusterStateService.createShard` → `IndexShard.startRecovery` → `PeerRecoveryTargetService` → `RecoverySourceHandler` → `RecoveryTarget.markAsDone` → `ShardStateAction` 的 started executor；无活动副本分支另读 `PrimaryShardAllocator` → `StoreRecovery`。

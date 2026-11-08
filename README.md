@@ -65,7 +65,7 @@
 
 ## Elasticsearch
 
-- [副本分片提升为主分片：从故障路由到历史收敛](ElasticSearch/replica-promotion.md)
+- [主分片从故障到恢复：副本提升、历史收敛与复制组重建](ElasticSearch/replica-promotion.md)
 
 - [`LRUQueryCache` 实现跟踪](ElasticSearch/lru-query-cache.md)
 - [Master 选举源码跟踪](<ElasticSearch/Master 选举源码跟踪.md>)
